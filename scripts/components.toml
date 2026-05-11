@@ -1,0 +1,31 @@
+[caliptra-mcu-sw-2p0]
+source_dir = "caliptra-mcu-sw-2p0-output"
+display_name = "Caliptra MCU SW 2.0"
+
+[caliptra-sw-2p1]
+source_dir = "caliptra-sw-2p1-output"
+display_name = "Caliptra SW 2.1"
+
+[opentitan-rom]
+source_dir = "opentitan-sw-output/rom"
+display_name = "OpenTitan ROM"
+
+[opentitan-rom-ext]
+source_dir = "opentitan-sw-output/rom_ext"
+display_name = "OpenTitan ROM EXT"
+
+[opentitan-manuf]
+source_dir = "opentitan-sw-output/manuf"
+display_name = "OpenTitan Manuf"
+
+[opentitan-lib]
+source_dir = "opentitan-sw-output/lib"
+display_name = "OpenTitan Lib"
+
+[caliptra-dpe]
+source_dir = "caliptra-dpe-output"
+display_name = "Caliptra DPE"
+
+[caliptra-dpe-1x]
+source_dir = "caliptra-dpe-1x-output"
+display_name = "Caliptra DPE 1.x"

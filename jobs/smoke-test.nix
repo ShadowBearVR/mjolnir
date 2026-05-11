@@ -1,0 +1,18 @@
+{ pkgs }:
+import ./default_job.nix { inherit pkgs; } {
+  name = "Smoke Test";
+  workspaceDir = "/tmp/smoke-test-workspace";
+  outputDir = "./test-output";
+  backend = "mock";
+
+  target = {
+    repoUrl = "https://github.com/chipsalliance/caliptra-sw.git";
+    repoName = "caliptra-sw";
+    commit = "latest";
+    fileCommand = "echo 'api/src/lib.rs'"; # Just analyze one file for quick smoke test
+  };
+
+  postExtract = ''
+    echo "Smoke Test: Post Extract Hook"
+  '';
+}

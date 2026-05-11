@@ -1,0 +1,13 @@
+# Bazel artifacts
+/bazel-*
+**/result
+**/test-output
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Generated vulnerability reports
+caliptra-mcu-sw-2p0-output/
+caliptra-sw-2p1-output/
+opentitan-sw-output/

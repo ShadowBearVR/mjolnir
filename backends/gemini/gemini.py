@@ -1,0 +1,218 @@
+"""Gemini Backend Orchestrator (Clean Open-Source Version).
+
+This script invokes the Gemini CLI using standard GCP credentials/project to analyze either:
+1. A list of files in parallel for security threats (Batch Mode).
+2. A single file with a custom query/prompt (Single-File Mode).
+"""
+
+import argparse
+import os
+
+import subprocess
+import common
+
+DEFAULT_TIMEOUT_SECS = 600
+
+
+def run_single_query(
+    input_path,
+    output_path,
+    system_prompt_path,
+    model,
+    gemini_bin,
+    project,
+    timeout_secs,
+):
+    """Invokes the Gemini CLI on a single input file and writes the output."""
+    print(
+        f" -> Running single query on {input_path} using Gemini ({model})...",
+        flush=True,
+    )
+
+    with open(system_prompt_path, "r") as f:
+        prompt = f.read().strip()
+
+    cmd = [
+        gemini_bin,
+        "--model",
+        model,
+        "--prompt",
+        prompt,
+        "--approval-mode",
+        "yolo",
+    ]
+
+    code_dir = os.environ.get("CODE_DIR")
+    if code_dir:
+        cmd.extend(["--include-directories", code_dir])
+
+    env = os.environ.copy()
+    if project:
+        env["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.expanduser(
+            "~/.config/gcloud/application_default_credentials.json"
+        )
+        env["GOOGLE_CLOUD_PROJECT"] = project
+
+    with open(input_path, "r") as in_f, open(output_path, "w") as out_f:
+        subprocess.run(
+            cmd,
+            stdin=in_f,
+            stdout=out_f,
+            env=env,
+            cwd=code_dir,
+            check=True,
+            timeout=timeout_secs,
+        )
+
+
+def run_analysis(
+    src_dir,
+    files_list_path,
+    output_path,
+    system_prompt_path,
+    model,
+    gemini_bin,
+    project,
+    silent_missing,
+    parallel,
+    timeout_secs,
+):
+    """Runs threat analysis on a list of files in parallel using Gemini."""
+
+    def analyze_single_file(file_rel_path, file_index, total_files, prompt):
+        full_path = os.path.join(src_dir, file_rel_path)
+        if not os.path.isfile(full_path):
+            if not silent_missing:
+                return (
+                    file_rel_path,
+                    f"Warning: Skipping missing file {file_rel_path}",
+                    True,
+                )
+            return file_rel_path, None, True
+
+        print(
+            f" -> ({file_index}/{total_files}) Analyzing {file_rel_path}...", flush=True
+        )
+
+        env = os.environ.copy()
+        if project:
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.expanduser(
+                "~/.config/gcloud/application_default_credentials.json"
+            )
+            env["GOOGLE_CLOUD_PROJECT"] = project
+
+        cmd = [
+            gemini_bin,
+            "--model",
+            model,
+            "--prompt",
+            prompt,
+        ]
+
+        try:
+            with open(full_path, "r") as input_f:
+                result = subprocess.run(
+                    cmd,
+                    stdin=input_f,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=True,
+                    timeout=timeout_secs,
+                )
+
+                report_chunk = common.clean_toml_output(result.stdout)
+                return file_rel_path, report_chunk, False
+        except subprocess.TimeoutExpired:
+            print(
+                f"Error analyzing {file_rel_path}: Job hung and timed out after {timeout_secs}s."
+            )
+            return (
+                file_rel_path,
+                common.format_timeout_error(file_rel_path, timeout_secs),
+                False,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Error analyzing {file_rel_path}: {e.stderr}")
+            return (
+                file_rel_path,
+                common.format_process_failure(file_rel_path, e.stderr),
+                False,
+            )
+
+    common.run_orchestrator(
+        src_dir=src_dir,
+        files_list_path=files_list_path,
+        output_path=output_path,
+        system_prompt_path=system_prompt_path,
+        parallel=parallel,
+        analyze_file_fn=analyze_single_file,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Gemini analysis on files.")
+
+    # Mode Selection
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--src", help="Source directory for batch mode")
+    group.add_argument("--input", help="Input file path for single query mode")
+
+    parser.add_argument(
+        "--files", help="Path to file listing files to analyze (batch mode only)"
+    )
+    parser.add_argument("--output", required=True, help="Output report path")
+    parser.add_argument("--prompt", required=True, help="Path to system prompt file")
+    parser.add_argument("--model", required=True, help="Gemini model name")
+    parser.add_argument("--gemini-bin", required=True, help="Path to gemini-cli binary")
+    parser.add_argument(
+        "--silent-missing",
+        action="store_true",
+        help="Silence missing file warnings (batch mode only)",
+    )
+    parser.add_argument(
+        "--parallel", type=int, default=1, help="Number of parallel workers"
+    )
+    parser.add_argument("--project", help="Google Cloud Project ID")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT_SECS,
+        help="Analysis timeout in seconds",
+    )
+
+    args = parser.parse_args()
+
+    if args.input:
+        # Single-file mode
+        if args.files or args.silent_missing or args.src:
+            parser.error(
+                "Arguments --files, --silent-missing, and --src are not compatible with --input mode."
+            )
+
+        run_single_query(
+            input_path=args.input,
+            output_path=args.output,
+            system_prompt_path=args.prompt,
+            model=args.model,
+            gemini_bin=args.gemini_bin,
+            project=args.project,
+            timeout_secs=args.timeout,
+        )
+    else:
+        # Batch mode
+        if not args.files:
+            parser.error("Argument --files is required for batch mode.")
+
+        run_analysis(
+            src_dir=args.src,
+            files_list_path=args.files,
+            output_path=args.output,
+            system_prompt_path=args.prompt,
+            model=args.model,
+            gemini_bin=args.gemini_bin,
+            project=args.project,
+            silent_missing=args.silent_missing,
+            parallel=args.parallel,
+            timeout_secs=args.timeout,
+        )

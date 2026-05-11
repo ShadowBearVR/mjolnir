@@ -1,0 +1,8 @@
+{
+  "name": "mjolnir",
+  "version": "0.1.0",
+  "private": true,
+  "devDependencies": {
+    "prettier": "^3.0.0"
+  }
+}

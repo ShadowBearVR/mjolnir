@@ -1,0 +1,60 @@
+{
+  pkgs,
+  model ? "gemini-2.5-pro",
+  googleCloudProject ? "caliptra-github-ci",
+  geminiBin ? "${pkgs.gemini-cli}/bin/gemini",
+  silentMissing ? false,
+  parallel ? 1,
+  timeout ? null,
+}:
+{
+  name = "gemini";
+
+  # Batch Mode: Analyzes multiple files in parallel
+  run =
+    {
+      systemPrompt,
+      src,
+      files,
+      output,
+    }:
+    ''
+      echo "Running Gemini backend (${model}) in Batch Mode..."
+
+      # Set PYTHONPATH to backends/ directory so that gemini/gemini.py
+      # can import the shared common.py module.
+      PYTHONPATH="${../.}" \
+      ${pkgs.python3}/bin/python3 ${./gemini.py} \
+        --src "${src}" \
+        --files "${files}" \
+        --output "${output}" \
+        --prompt "${systemPrompt}" \
+        --model "${model}" \
+        --gemini-bin "${geminiBin}" \
+        --parallel "''${PARALLEL:-${toString parallel}}" \
+        ${if silentMissing then "--silent-missing" else ""} \
+        ${if googleCloudProject != null then "--project \"${googleCloudProject}\"" else ""} \
+        ${if timeout != null then "--timeout ${toString timeout}" else ""}
+    '';
+
+  # Single-File Mode: Analyzes or processes a single file
+  runSingle =
+    {
+      systemPrompt,
+      input,
+      output,
+    }:
+    ''
+      echo "Running Gemini backend (${model}) in Single-File Mode..."
+
+      PYTHONPATH="${../.}" \
+      ${pkgs.python3}/bin/python3 ${./gemini.py} \
+        --input "${input}" \
+        --output "${output}" \
+        --prompt "${systemPrompt}" \
+        --model "${model}" \
+        --gemini-bin "${geminiBin}" \
+        ${if googleCloudProject != null then "--project \"${googleCloudProject}\"" else ""} \
+        ${if timeout != null then "--timeout ${toString timeout}" else ""}
+    '';
+}

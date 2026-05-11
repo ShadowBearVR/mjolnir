@@ -1,0 +1,30 @@
+{ pkgs }:
+{ subjobName, searchPaths, subdir, extensions ? [ "c" "h" ], timeout ? 900, backend ? "gemini" }:
+let
+  # Helper to build fd flags for extensions: [ "c" "h" ] -> "-e c -e h"
+  fdExtFlags = pkgs.lib.concatMapStringsSep " " (ext: "-e ${ext}") extensions;
+  # Helper to build fd exclude flags: [ "c" "h" ] -> "-E '*.c' -E '*.h'"
+  fdExcludeFlags = pkgs.lib.concatMapStringsSep " " (ext: "-E '*.${ext}'") extensions;
+  fdSearchFlags = pkgs.lib.concatMapStringsSep " " (path: "--search-path ${path}") searchPaths;
+in
+import ../default_job.nix { inherit pkgs; } {
+  name = "OpenTitan Earlgrey A2 SW Scan - ${subjobName}";
+  workspaceDir = "/tmp/opentitan-workspace/${subdir}";
+  outputDir = "./opentitan-sw-output/${subdir}";
+  agentDir = ../../agents/c_auditor;
+  inherit timeout;
+  inherit backend;
+  contextFile = ../../threat-models/opentitan/THREAT_MODEL_FIRMWARE_SMALL.md;
+
+  target = {
+    repoUrl = "https://github.com/lowrisc/opentitan";
+    repoName = "opentitan";
+    commit = "earlgrey_1.0.0";
+    fileCommand = "${pkgs.fd}/bin/fd -t f ${fdExtFlags} ${fdSearchFlags}";
+  };
+
+  postExtract = ''
+    echo "Deleting non-target files..."
+    cd "$CODE_DIR" && ${pkgs.fd}/bin/fd -t f -H -I ${fdExcludeFlags} -x rm {}
+  '';
+}
