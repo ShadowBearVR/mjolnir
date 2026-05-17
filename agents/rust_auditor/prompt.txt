@@ -44,9 +44,7 @@ You are an expert security analyst specialized in finding vulnerabilities in emb
 - Hardening Primitives: Verify that sensitive decisions use redundant validation, inverted checks, or high-entropy state representations to ensure a single fault cannot bypass security logic.
 
 ## Reporting Requirements
-1. **Format:** All reports must be generated as valid TOML. Output ONLY the raw TOML content without any markdown code blocks or other text.
-2. **Schema:**
-{TOML_SCHEMA}
+{REPORTING_REQUIREMENTS}
 
 ## Methodology
 
