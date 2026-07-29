@@ -1,0 +1,13 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+{
+  name = "rot-hardened";
+  description = "Heavy weighting towards low-level HW/FW boundaries, deep state transitions, and specification mismatches";
+  strategy = "weighted";
+  total = 30;
+  weights = {
+    spatial = { INTRA_PROCEDURAL = 0.2; INTER_PROCEDURAL = 0.5; CROSS_COMPONENT = 0.3; };
+    temporal = { STATELESS = 0.2; SHALLOW_STATE = 0.4; DEEP_STATE_RACE = 0.4; };
+    subtlety = { STANDARD_CWE = 0.1; LOGIC_SPEC_MISMATCH = 0.4; HW_FW_INTERFACE = 0.5; };
+  };
+}
