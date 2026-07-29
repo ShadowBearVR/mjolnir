@@ -1,0 +1,22 @@
+{
+  "dataset_id": "opentitan_v01",
+  "target_project": "opentitan",
+  "profile": "trivial",
+  "status": "FAILED",
+  "started_at": "2026-07-20T18:54:14.771839+00:00",
+  "updated_at": "2026-07-20T18:58:49.475588+00:00",
+  "total_requested": 1,
+  "completed_count": 0,
+  "failed_count": 1,
+  "vulnerabilities": [
+    {
+      "id": "VULN-001",
+      "cwe_id": "CWE-1276",
+      "cwe_name": "Hardware Child Block Incorrectly Connected to Parent System",
+      "status": "FAILED",
+      "updated_at": "2026-07-20T18:54:14.774745+00:00",
+      "build_passed": false,
+      "error_message": "ReAct agent failed to produce a passing patch diff."
+    }
+  ]
+}

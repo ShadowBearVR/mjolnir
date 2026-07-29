@@ -166,15 +166,66 @@
             '';
           };
 
+          nidhogg-app = pkgs.stdenv.mkDerivation {
+            name = "nidhogg-app";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
 
+            installPhase = ''
+              mkdir -p $out/bin $out/lib
+              cp -r * $out/lib/
+
+              makeWrapper ${pythonEnv}/bin/python3 $out/bin/nidhogg-fetch-cwes \
+                --add-flags "$out/lib/nidhogg/generate/fetch_cwes.py" \
+                --prefix PYTHONPATH : "$out/lib:$out/lib/app/mjolnir" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.git pkgs.nix ]}" \
+                --set GOOGLE_API_USE_CLIENT_CERTIFICATE false
+
+              makeWrapper ${pythonEnv}/bin/python3 $out/bin/nidhogg-generate \
+                --add-flags "$out/lib/nidhogg/generate/generator.py" \
+                --prefix PYTHONPATH : "$out/lib:$out/lib/app/mjolnir" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.git pkgs.nix ]}" \
+                --set GOOGLE_API_USE_CLIENT_CERTIFICATE false
+            '';
+          };
+
+          nidhogg-fetch-cwes = pkgs.writeShellApplication {
+            name = "nidhogg-fetch-cwes";
+            runtimeInputs = [ nidhogg-app ];
+            text = ''
+              nidhogg-fetch-cwes "$@"
+            '';
+          };
+
+          nidhogg-generate = pkgs.writeShellApplication {
+            name = "nidhogg-generate";
+            runtimeInputs = [ nidhogg-app ];
+            text = ''
+              nidhogg-generate "$@"
+            '';
+          };
+
+          autodiscoverNidhoggJobs = import ./nidhogg/nix/discovery.nix;
+          makeNidhoggJob = { project, job, runner, nidhogg-app }:
+            import ./nidhogg/nix/orchestrator.nix {
+              inherit pkgs project job runner nidhogg-app;
+            };
+
+          discoveredNidhogg = autodiscoverNidhoggJobs {
+            inherit pkgs makeNidhoggJob nidhogg-app;
+            runners = {};
+          };
         in
-          discovered // {
+          discovered // discoveredNidhogg // {
             inherit
               mjolnir-app
               web-viewer
               deploy-gcs-web
               deploy-gcs-runs
-              emit-report;
+              emit-report
+              nidhogg-app
+              nidhogg-fetch-cwes
+              nidhogg-generate;
 
             test-all = makeGroup {
               name = "test-all";

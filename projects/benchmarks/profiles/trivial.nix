@@ -1,0 +1,13 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+{
+  name = "trivial";
+  description = "Trivial baseline profile: 1 vulnerability pinned at Level 1 (INTRA_PROCEDURAL, STATELESS, STANDARD_CWE)";
+  strategy = "fixed";
+  fixed_ncm = {
+    spatial_scope = "INTRA_PROCEDURAL";
+    temporal_depth = "STATELESS";
+    domain_subtlety = "STANDARD_CWE";
+  };
+  total = 1;
+}
