@@ -127,7 +127,7 @@ def run_analysis(
 
     # Run the graph
     status = "Success"
-    vulnerabilities: list[Vulnerability] = []
+    vulnerabilities: list[Vulnerability] | None = None
     try:
         for ev in runner.run(
             user_id="mjolnir_user",
@@ -144,7 +144,8 @@ def run_analysis(
     # Write usage report
     usage_tracker.write_to_disk(run_dir)
 
-    if not vulnerabilities and run_dir:
+    # Only fall back to Phase 1 checkpoints if Phase 2 failed or was interrupted
+    if vulnerabilities is None and run_dir:
         audit_path = Path(run_dir) / "finding_phase_1.json"
         if not audit_path.exists():
             audit_path = Path(run_dir) / "audit_findings.json"
@@ -160,6 +161,9 @@ def run_analysis(
                     vulnerabilities = raw_vulns
             except Exception as e:
                 logger.error(f"Could not load fallback Phase 1 vulnerabilities: {e}")
+
+    if vulnerabilities is None:
+        vulnerabilities = []
 
     # Ensure all elements in vulnerabilities are validated Pydantic models
     clean_vulns: list[Vulnerability] = []

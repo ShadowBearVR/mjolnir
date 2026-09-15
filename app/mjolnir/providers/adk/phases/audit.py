@@ -20,7 +20,7 @@ from providers.adk.utilities.async_runner import (
     run_batch_with_concurrency,
 )
 from providers.adk.utilities.cache_manager import PhaseContextCache
-from utilities.git import get_file_diff
+from utilities.git import get_file_diff_async
 from utilities.logger import logger
 
 
@@ -29,9 +29,8 @@ def _write_checkpoint_sync(audit_path: Path, vulns_data: list[dict]) -> None:
         json.dump(vulns_data, f, indent=2)
 
 
-def _read_file_contents_sync(full_file_path: Path) -> str:
-    with open(full_file_path, "r", errors="ignore") as f:
-        return f.read()
+async def _read_file_contents_async(full_file_path: Path) -> str:
+    return await asyncio.to_thread(full_file_path.read_text, encoding="utf-8", errors="ignore")
 
 
 async def checkpoint_audit_findings(
@@ -40,14 +39,14 @@ async def checkpoint_audit_findings(
     phase_id: int = 1,
     filename: str = None,
 ) -> None:
-    """Checkpoints audit findings to a JSON file on disk."""
+    """Checkpoints audit findings to a JSON file on disk without blocking the event loop."""
     if not run_dir or not Path(run_dir).exists():
         return
     checkpoint_name = filename or f"finding_phase_{phase_id}.json"
     audit_path = Path(run_dir) / checkpoint_name
     try:
         vulns_data = [v.model_dump() for v in vulns]
-        _write_checkpoint_sync(audit_path, vulns_data)
+        await asyncio.to_thread(_write_checkpoint_sync, audit_path, vulns_data)
         logger.info(f"Checkpointed {len(vulns)} Phase {phase_id} vulnerabilities to {audit_path}")
     except Exception as e:
         logger.error(f"Failed to checkpoint Phase {phase_id} vulnerabilities: {e}")
@@ -71,6 +70,7 @@ async def audit_phase(ctx: Context, node_input: list[str]) -> list[Vulnerability
         model=model,
         instruction=auditor_instruction,
         tools=auditor_tools,
+        output_schema=SecurityReport,
         display_name=f"mjolnir-phase1-{Path(code_dir).name}",
     ) as cache:
         auditor_agent = get_auditor_agent(model, threat_model, cached_content=cache.cache_name)
@@ -81,13 +81,15 @@ async def audit_phase(ctx: Context, node_input: list[str]) -> list[Vulnerability
         async def audit_single_file(f_path: str) -> list[Vulnerability]:
             full_file_path = Path(code_dir) / f_path
             try:
-                contents = _read_file_contents_sync(full_file_path)
+                contents = await _read_file_contents_async(full_file_path)
             except Exception as e:
                 logger.error(f"Could not read {f_path}: {e}")
                 return []
 
             if diff_base:
-                file_diff = get_file_diff(code_dir, diff_base, diff_head or "HEAD", f_path)
+                file_diff = await get_file_diff_async(
+                    code_dir, diff_base, diff_head or "HEAD", f_path
+                )
                 diff_section = (
                     f"\n\n### Pull Request Diff (Changes Under Review):\n```diff\n{file_diff}\n```"
                     if file_diff
@@ -110,7 +112,23 @@ async def audit_phase(ctx: Context, node_input: list[str]) -> list[Vulnerability
                 run_id=f_path,
             )
 
-            if not report or not hasattr(report, "vulnerabilities") or not report.vulnerabilities:
+            if report is None:
+                logger.warning(
+                    f"AuditorAgent returned no report for '{f_path}' "
+                    "(potential refusal, timeout, or schema validation failure)."
+                )
+                return []
+
+            if getattr(report, "refusal_reason", None):
+                logger.warning(f"AuditorAgent soft refusal on '{f_path}': {report.refusal_reason}")
+                usage_tracker = ctx.state.get("usage_tracker")
+                if usage_tracker:
+                    await usage_tracker.track_error(
+                        ValueError(f"SoftRefusal: {report.refusal_reason}"),
+                        auditor_agent.name,
+                    )
+
+            if not hasattr(report, "vulnerabilities") or not report.vulnerabilities:
                 return []
 
             vulns: list[Vulnerability] = []

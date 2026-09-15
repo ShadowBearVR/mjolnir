@@ -5,11 +5,9 @@ import asyncio
 import re
 from typing import Any, Optional
 
+from constants import DEFAULT_DISPATCH_STAGGER_SECONDS
 from tqdm import tqdm
 from utilities.logger import logger
-
-# Default stagger delay between worker launches to prevent concurrent prefill spikes
-DEFAULT_DISPATCH_STAGGER_SECONDS = 0.25
 
 
 def extract_agent_output(res: Any, expected_schema: Any) -> Any:
@@ -54,7 +52,19 @@ async def run_agent_node(
             use_sub_branch=True,
             override_isolation_scope=run_id,
         )
-        return extract_agent_output(res, expected_schema) if expected_schema else res
+        extracted = extract_agent_output(res, expected_schema) if expected_schema else res
+        if expected_schema and extracted is None and res is not None:
+            schema_name = getattr(expected_schema, "__name__", str(expected_schema))
+            logger.warning(
+                f"Agent {agent.name} output failed validation against {schema_name} for {run_id}"
+            )
+            tracker = ctx.state.get("usage_tracker")
+            if tracker:
+                tracker.track_error(
+                    ValueError(f"SchemaValidationError: {schema_name}"),
+                    agent.name,
+                )
+        return extracted
     except Exception as e:
         tracker = ctx.state.get("usage_tracker")
         if tracker:

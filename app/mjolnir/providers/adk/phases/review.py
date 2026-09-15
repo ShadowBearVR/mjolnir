@@ -45,6 +45,7 @@ async def review_phase(ctx: Context, node_input: list[Vulnerability]) -> list[Vu
         model=model,
         instruction=reviewer_instruction,
         tools=reviewer_tools,
+        output_schema=ReviewFinding,
         display_name=f"mjolnir-phase2-{Path(code_dir).name}",
     ) as cache:
         reviewer_agent = get_reviewer_agent(model, threat_model, cached_content=cache.cache_name)

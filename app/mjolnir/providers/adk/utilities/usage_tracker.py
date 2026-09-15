@@ -129,9 +129,57 @@ class UsageTracker:
             agent_name = getattr(ev, "author", None) or agent_name
             item_key = raw_key
 
+        target_key = item_key or agent_name
+
+        # Check for event-level refusal or non-standard finish reason
+        raw_finish_reason = getattr(ev, "finish_reason", None)
+        if raw_finish_reason is not None:
+            reason_name = getattr(raw_finish_reason, "name", str(raw_finish_reason))
+            if "." in reason_name:
+                reason_name = reason_name.split(".", 1)[1]
+
+            if reason_name not in ("STOP", "FINISH_REASON_UNSPECIFIED", "None", ""):
+                logger.warning(
+                    f"LLM refusal or non-standard finish_reason '{reason_name}' "
+                    f"(agent={agent_name}, target={target_key})"
+                )
+                err_key = f"FinishReason.{reason_name}"
+                self.error_counts[err_key] = self.error_counts.get(err_key, 0) + 1
+                self.total_usage["total_errors"] += 1
+                if agent_name not in self.usage_by_agent:
+                    self.usage_by_agent[agent_name] = self._get_empty_agent_stats()
+                self.usage_by_agent[agent_name]["errors"] += 1
+
+                if target_key not in self.reasoning_log:
+                    self.reasoning_log[target_key] = []
+                self.reasoning_log[target_key].append(
+                    {
+                        "agent": agent_name,
+                        "type": "refusal",
+                        "finish_reason": str(reason_name),
+                    }
+                )
+
+        # Check for event-level error code / message
+        error_code = getattr(ev, "error_code", None)
+        error_msg = getattr(ev, "error_message", None)
+        if error_code or error_msg:
+            err_str = (
+                f"{error_code}: {error_msg}"
+                if error_code and error_msg
+                else str(error_code or error_msg)
+            )
+            logger.error(
+                f"Event error reported: {err_str} (agent={agent_name}, target={target_key})"
+            )
+            self.error_counts[err_str] = self.error_counts.get(err_str, 0) + 1
+            self.total_usage["total_errors"] += 1
+            if agent_name not in self.usage_by_agent:
+                self.usage_by_agent[agent_name] = self._get_empty_agent_stats()
+            self.usage_by_agent[agent_name]["errors"] += 1
+
         # Inspect and record thoughts, tool calls, and tool responses
         if hasattr(ev, "content") and ev.content and hasattr(ev.content, "parts"):
-            target_key = item_key or agent_name
             if target_key not in self.reasoning_log:
                 self.reasoning_log[target_key] = []
 
@@ -172,11 +220,22 @@ class UsageTracker:
                 elif fn_res:
                     tool_name = getattr(fn_res, "name", "unknown_tool")
                     resp = getattr(fn_res, "response", "")
-                    res_str = resp.get("result", "") if isinstance(resp, dict) else str(resp)
-                    clean_str = res_str.strip() if isinstance(res_str, str) else str(res_str)
 
-                    # Tool failure is an explicit tool-level error prefix
-                    is_error = clean_str.startswith("Error:")
+                    # Structured error detection: Check dict for ADK's native "error" field first
+                    is_error = False
+                    if isinstance(resp, dict):
+                        if "error" in resp:
+                            is_error = True
+                            clean_str = str(resp["error"]).strip()
+                        elif "result" in resp:
+                            clean_str = str(resp["result"]).strip()
+                            is_error = clean_str.startswith(("Error:", "Error executing", "Error "))
+                        else:
+                            clean_str = json.dumps(resp)
+                    else:
+                        clean_str = str(resp).strip()
+                        is_error = clean_str.startswith(("Error:", "Error executing", "Error "))
+
                     self.track_tool_call(
                         tool_name=tool_name,
                         success=not is_error,
