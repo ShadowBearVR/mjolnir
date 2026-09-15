@@ -27,6 +27,14 @@ def run_analysis(
 ) -> list:
     """Instantly returns hardcoded mock findings and compiles a mock flow history for testing."""
 
+    logger.info("Executing initial project exploration (Project Expert - Mock)...")
+    if threat_model_context:
+        logger.debug("Project Expert ingested threat model context.")
+    if run_dir:
+        summary_path = os.path.join(run_dir, "project_expert_summary.md")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("# Project Expert Summary (Mock)\n\nMock project architecture summary.\n")
+
     all_vulnerabilities = []
 
     pbar = tqdm(files, desc="\tScanning files", unit="file")

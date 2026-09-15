@@ -9,6 +9,7 @@ from google.adk.workflow import node
 from agent_tools.ast_search import ast_search
 from agent_tools.ctags_search import ctags_search
 from agent_tools.grep_search import grep_search
+from agent_tools.project_expert import ask_project_expert
 from agent_tools.read_file import read_file
 from constants import PHASE_2_ID, PHASE_2_NAME
 from data.review_finding import ReviewFinding
@@ -36,11 +37,12 @@ async def review_phase(ctx: Context, node_input: list[Vulnerability]) -> list[Vu
 
     model = ctx.state["model"]
     threat_model = ctx.state["threat_model_context"]
+    project_summary = ctx.state.get("project_expert_summary", "")
     batch_size = ctx.state["batch_size"]
     code_dir = ctx.state.get("code_dir", "target")
 
-    reviewer_tools = [read_file, grep_search, ctags_search, ast_search]
-    reviewer_instruction = build_reviewer_instruction(threat_model)
+    reviewer_tools = [read_file, grep_search, ctags_search, ast_search, ask_project_expert]
+    reviewer_instruction = build_reviewer_instruction(threat_model, project_summary)
 
     with PhaseContextCache(
         model=model,
@@ -49,7 +51,9 @@ async def review_phase(ctx: Context, node_input: list[Vulnerability]) -> list[Vu
         output_schema=ReviewFinding,
         display_name=f"mjolnir-phase2-{Path(code_dir).name}",
     ) as cache:
-        reviewer_agent = get_reviewer_agent(model, threat_model, cached_content=cache.cache_name)
+        reviewer_agent = get_reviewer_agent(
+            model, threat_model, project_summary, cached_content=cache.cache_name
+        )
 
         async def review_single_vuln(vuln: Union[Vulnerability, dict]) -> Vulnerability:
             if isinstance(vuln, dict):

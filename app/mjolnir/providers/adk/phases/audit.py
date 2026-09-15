@@ -11,6 +11,7 @@ from agent_tools.ast_search import ast_search
 from agent_tools.ctags_search import ctags_search
 from agent_tools.glob import glob
 from agent_tools.grep_search import grep_search
+from agent_tools.project_expert import ask_project_expert
 from agent_tools.read_file import read_file
 from constants import PHASE_1_ID
 from data.security_report import SecurityReport
@@ -61,11 +62,12 @@ async def audit_phase(ctx: Context, node_input: list[str]) -> list[Vulnerability
     model = ctx.state["model"]
     code_dir = ctx.state["code_dir"]
     threat_model = ctx.state["threat_model_context"]
+    project_summary = ctx.state.get("project_expert_summary", "")
     batch_size = ctx.state["batch_size"]
     run_dir = ctx.state.get("run_dir")
 
-    auditor_tools = [read_file, glob, grep_search, ctags_search, ast_search]
-    auditor_instruction = build_auditor_instruction(threat_model)
+    auditor_tools = [read_file, glob, grep_search, ctags_search, ast_search, ask_project_expert]
+    auditor_instruction = build_auditor_instruction(threat_model, project_summary)
 
     with PhaseContextCache(
         model=model,
@@ -74,7 +76,9 @@ async def audit_phase(ctx: Context, node_input: list[str]) -> list[Vulnerability
         output_schema=SecurityReport,
         display_name=f"mjolnir-phase1-{Path(code_dir).name}",
     ) as cache:
-        auditor_agent = get_auditor_agent(model, threat_model, cached_content=cache.cache_name)
+        auditor_agent = get_auditor_agent(
+            model, threat_model, project_summary, cached_content=cache.cache_name
+        )
 
         diff_base = ctx.state.get("diff_base")
         diff_head = ctx.state.get("diff_head")
