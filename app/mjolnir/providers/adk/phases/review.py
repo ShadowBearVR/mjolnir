@@ -67,7 +67,24 @@ async def review_phase(ctx: Context, node_input: list[Vulnerability]) -> list[Vu
                 )
 
                 if verdict:
-                    vuln.add(phase_id="2", phase_name="Initial Review", finding=verdict)
+                    if getattr(verdict, "refusal_reason", None):
+                        logger.warning(
+                            f"ReviewerAgent soft refusal on '{vuln.file}' (ID {vuln.id}): "
+                            f"{verdict.refusal_reason}"
+                        )
+                        usage_tracker = ctx.state.get("usage_tracker")
+                        if usage_tracker:
+                            await usage_tracker.track_error(
+                                ValueError(f"SoftRefusal: {verdict.refusal_reason}"),
+                                reviewer_agent.name,
+                            )
+                        vuln.add_skipped(
+                            "2",
+                            "Initial Review",
+                            f"Model soft refusal: {verdict.refusal_reason}",
+                        )
+                    else:
+                        vuln.add(phase_id="2", phase_name="Initial Review", finding=verdict)
                 else:
                     vuln.add_skipped(
                         "2",
