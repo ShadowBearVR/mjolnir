@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
-
+from constants import VULNERABILITIES_FILENAME, VULNERABILITIES_MINIMAL_FILENAME
 from data.status import Status
 from executors.ctags import CtagsRunner
 import providers.adk.main as adk
@@ -54,7 +54,11 @@ def _run_orchestrator():
     parser.add_argument(
         "--mode",
         choices=["fast", "full"],
-        help="Pipeline depth mode: 'fast' (discovery + initial review) or 'full' (adds project expert and deep verification)",
+        help="Pipeline depth mode: 'fast' (discovery + deduplication + initial review) or 'full' (adds project expert and deep verification)",
+    )
+    parser.add_argument(
+        "--bucket",
+        help="Optional GCS bucket name, URI, or local bucket path for inter-run deduplication against historical Open findings",
     )
     parser.add_argument(
         "--min-poc-severity",
@@ -232,6 +236,13 @@ def _run_orchestrator():
     # Execute analysis via selected model
     pipeline_mode = args.mode or job.get("mode")
     min_poc_severity = args.min_poc_severity or job.get("minPocSeverity") or "Medium"
+    bucket = (
+        args.bucket
+        or job.get("bucket")
+        or project.get("bucket")
+        or os.environ.get("MJOLNIR_GCS_BUCKET")
+    )
+    project_output_dir = config.get("projectOutputDir")
     logger.info(
         f"Executing analysis (model={model_name}, mode={pipeline_mode}, min_poc_severity={min_poc_severity})."
     )
@@ -249,6 +260,9 @@ def _run_orchestrator():
             pipeline_mode,
             ingest_path=ingest_path,
             min_poc_severity=min_poc_severity,
+            bucket=bucket,
+            project_name=repo_name,
+            project_output_dir=project_output_dir,
         )
     else:
         vulnerabilities, status = adk.run_analysis(
@@ -263,6 +277,9 @@ def _run_orchestrator():
             diff_base=diff_base,
             diff_head=diff_head,
             min_poc_severity=min_poc_severity,
+            bucket=bucket,
+            project_name=repo_name,
+            project_output_dir=project_output_dir,
         )
 
     # Update metadata with status
@@ -277,7 +294,7 @@ def _run_orchestrator():
 
     # Write vulnerabilities (all) to disk
 
-    vulnerabilities_path = Path(run_dir) / "vulnerabilities.json"
+    vulnerabilities_path = Path(run_dir) / VULNERABILITIES_FILENAME
     with open(vulnerabilities_path, "w") as f:
         json.dump([v.model_dump() for v in vulnerabilities], f, indent=2)
 
@@ -286,7 +303,7 @@ def _run_orchestrator():
     vulnerabilities_minimal = [v for v in vulnerabilities if v.status == Status.OPEN]
 
     # Write vulnerabilities (minimal) to disk
-    vulnerabilities_minimal_path = Path(run_dir) / "vulnerabilities_minimal.json"
+    vulnerabilities_minimal_path = Path(run_dir) / VULNERABILITIES_MINIMAL_FILENAME
     with open(vulnerabilities_minimal_path, "w") as f:
         json.dump(
             [v.model_dump(exclude={"history"}) for v in vulnerabilities_minimal],
