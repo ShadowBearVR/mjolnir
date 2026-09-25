@@ -24,6 +24,7 @@
       lib = {
         discoverProjectJobs = import ./nix/discover_project.nix;
         makeJob = import ./nix/orchestrator.nix;
+        makeBenchmark = import ./nix/nidhogg.nix;
         makeGroup = import ./nix/group.nix;
       };
 
@@ -127,9 +128,32 @@
             '';
           };
 
+          nidhogg-app = pkgs.stdenv.mkDerivation {
+            name = "nidhogg-app";
+            src = ./app/nidhogg;
+
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
+            installPhase = ''
+              mkdir -p $out/bin $out/lib/nidhogg
+              cp -r * $out/lib/nidhogg/
+
+              makeWrapper ${pythonEnv}/bin/python3 $out/bin/nidhogg-run \
+                --add-flags "-m nidhogg.main" \
+                --prefix PYTHONPATH : "$out/lib:${mjolnir-app}/lib" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.git pkgs.ripgrep pkgs.universal-ctags pkgs.ast-grep pkgs.bubblewrap pkgs.patch mjolnir-app ]}" \
+                --set GOOGLE_API_USE_CLIENT_CERTIFICATE false
+            '';
+          };
+
           makeJob = { project, job, devShell ? null }: 
             import ./nix/orchestrator.nix {
               inherit pkgs project job devShell mjolnir-app;
+            };
+
+          makeBenchmark = { benchmark, devShell ? null }:
+            import ./nix/nidhogg.nix {
+              inherit pkgs benchmark devShell nidhogg-app mjolnir-app;
             };
 
           makeGroup = { name, description, jobs }:
@@ -138,6 +162,35 @@
             };
 
           discovered = autodiscoverJobs { inherit pkgs makeJob; };
+
+          caliptraSwShell = import ./benchmarks/projects/caliptra-sw/shell.nix { inherit pkgs; };
+          openprotShell = import ./projects/openprot/shell.nix { inherit pkgs; };
+          opentitanShell = import ./projects/opentitan/shell.nix { inherit pkgs; };
+
+          nidhogg-caliptra-sw = makeBenchmark {
+            benchmark = import ./benchmarks/projects/caliptra-sw/benchmark.nix;
+            devShell = caliptraSwShell;
+          };
+
+          nidhogg-caliptra-mcu-sw = makeBenchmark {
+            benchmark = import ./benchmarks/projects/caliptra-mcu-sw/benchmark.nix;
+            devShell = caliptraSwShell;
+          };
+
+          nidhogg-caliptra-dpe = makeBenchmark {
+            benchmark = import ./benchmarks/projects/caliptra-dpe/benchmark.nix;
+            devShell = caliptraSwShell;
+          };
+
+          nidhogg-openprot = makeBenchmark {
+            benchmark = import ./benchmarks/projects/openprot/benchmark.nix;
+            devShell = openprotShell;
+          };
+
+          nidhogg-opentitan = makeBenchmark {
+            benchmark = import ./benchmarks/projects/opentitan/benchmark.nix;
+            devShell = opentitanShell;
+          };
 
           web-viewer = pkgs.writeShellApplication {
             name = "mjolnir-web-viewer";
@@ -187,6 +240,12 @@
           discovered // {
             inherit
               mjolnir-app
+              nidhogg-app
+              nidhogg-caliptra-sw
+              nidhogg-caliptra-mcu-sw
+              nidhogg-caliptra-dpe
+              nidhogg-openprot
+              nidhogg-opentitan
               web-viewer
               deploy-gcs-web
               deploy-gcs-runs

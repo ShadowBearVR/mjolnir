@@ -65,6 +65,27 @@ def _run_orchestrator():
         choices=["Informational", "Low", "Medium", "High", "Critical", "None"],
         help="Minimum finding severity required to synthesize a PoC in full mode (default: Medium)",
     )
+    parser.add_argument(
+        "--phases",
+        help="Optional comma-separated list of workflow phase IDs to execute (e.g. 'discovery' for ablation)",
+    )
+    parser.add_argument(
+        "--no-threat-model",
+        action="store_true",
+        help="Disable loading threat model context (used for Raw LLM ablation tier)",
+    )
+    parser.add_argument(
+        "--local-dir",
+        help="Override target local directory to analyze (e.g. ephemeral benchmark snapshot)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Override base output directory for run artifacts",
+    )
+    parser.add_argument(
+        "--model",
+        help="Override model identifier",
+    )
     args, unknown_args = parser.parse_known_args()
 
     if not args.spec:
@@ -88,9 +109,9 @@ def _run_orchestrator():
     repo_url = project.get("repoUrl")
     repo_ref = job.get("ref", "HEAD")
 
-    model_name = job.get("model")
+    model_name = args.model or job.get("model")
 
-    local_dir = job.get("localDir")
+    local_dir = args.local_dir or job.get("localDir")
     raw_workspace = config.get("workspaceDir")
     workspace_dir = str(Path(raw_workspace).expanduser().resolve())
 
@@ -104,7 +125,9 @@ def _run_orchestrator():
 
     # Load threat model
 
-    threat_model_context = load_threat_model(project.get("threatModel"))
+    threat_model_context = (
+        "" if args.no_threat_model else load_threat_model(project.get("threatModel"))
+    )
 
     # Create output directory
 
@@ -113,7 +136,7 @@ def _run_orchestrator():
     timestamp_pretty = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     run_id = timestamp_dir
-    raw_output = config.get("outputDir")
+    raw_output = args.output_dir or config.get("outputDir")
     output_dir = str(Path(raw_output).expanduser().resolve())
     run_dir = str(Path(output_dir) / f"run_{run_id}")
     Path(run_dir).mkdir(parents=True, exist_ok=False)
@@ -236,6 +259,12 @@ def _run_orchestrator():
     # Execute analysis via selected model
     pipeline_mode = args.mode or job.get("mode")
     min_poc_severity = args.min_poc_severity or job.get("minPocSeverity") or "Medium"
+    raw_phases = args.phases or job.get("phases")
+    phase_ids = (
+        [p.strip() for p in raw_phases.split(",") if p.strip()]
+        if isinstance(raw_phases, str)
+        else (list(raw_phases) if isinstance(raw_phases, list) else None)
+    )
     bucket = (
         args.bucket
         or job.get("bucket")
@@ -263,6 +292,7 @@ def _run_orchestrator():
             bucket=bucket,
             project_name=repo_name,
             project_output_dir=project_output_dir,
+            phase_ids=phase_ids,
         )
     else:
         vulnerabilities, status = adk.run_analysis(
@@ -280,6 +310,7 @@ def _run_orchestrator():
             bucket=bucket,
             project_name=repo_name,
             project_output_dir=project_output_dir,
+            phase_ids=phase_ids,
         )
 
     # Update metadata with status
