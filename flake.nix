@@ -219,8 +219,17 @@
                 discovered.opentitan-rtl
               ];
             };
+
+            openprot-all = makeGroup {
+              name = "openprot-all";
+              description = "All OpenPRoT jobs";
+              jobs = [
+                discovered.openprot-main
+              ];
+            };
           }
       );
     };
 }
+
 
