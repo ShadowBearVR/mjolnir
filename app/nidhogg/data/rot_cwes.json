@@ -1,0 +1,72 @@
+{
+  "version": "1.0.0",
+  "description": "Curated Root-of-Trust (RoT) and Rust/C Firmware CWE Taxonomy stratified by NCM Domain Subtlety level",
+  "tiers": {
+    "1": [
+      {
+        "cwe_id": "CWE-190",
+        "name": "Integer Overflow or Wraparound",
+        "rot_manifestation": "Wrapping payload length or header offset arithmetic (e.g., wrapping_add / unchecked cast) bypassing buffer length validation."
+      },
+      {
+        "cwe_id": "CWE-125",
+        "name": "Out-of-bounds Read",
+        "rot_manifestation": "Unchecked slice indexing or pointer arithmetic reading past command mailbox or certificate parsing buffers."
+      },
+      {
+        "cwe_id": "CWE-787",
+        "name": "Out-of-bounds Write",
+        "rot_manifestation": "Off-by-one or miscalculated length bound when copying mailbox command words or cryptographic digest outputs."
+      },
+      {
+        "cwe_id": "CWE-670",
+        "name": "Always-Incorrect Control Flow Implementation",
+        "rot_manifestation": "Inverted boolean status check or early return on error path allowing unauthorized command execution."
+      }
+    ],
+    "2": [
+      {
+        "cwe_id": "CWE-226",
+        "name": "Sensitive Information in Resource Not Removed Before Reuse",
+        "rot_manifestation": "Omitting zeroization of Key Vault Staging buffers, CDI/DPE intermediate seeds, or mailbox SRAM after command completion or error."
+      },
+      {
+        "cwe_id": "CWE-347",
+        "name": "Improper Verification of Cryptographic Signature",
+        "rot_manifestation": "Accepting partial digest match, skipping ECDSA/LMS signature verification flag check on warm reset, or ignoring public key revocation mask."
+      },
+      {
+        "cwe_id": "CWE-295",
+        "name": "Improper Certificate Validation",
+        "rot_manifestation": "Failing to enforce X.509/DICE certificate key-usage bits, basic constraints, or TCB SVN monotonic version comparison."
+      },
+      {
+        "cwe_id": "CWE-372",
+        "name": "Incomplete Internal State Distinction",
+        "rot_manifestation": "Failing to transition or lock DPE context / boot lifecycle state between ROM -> FMC -> Runtime handover."
+      }
+    ],
+    "3": [
+      {
+        "cwe_id": "CWE-362",
+        "name": "Concurrent Execution using Shared Resource with Improper Synchronization",
+        "rot_manifestation": "TOCTOU window where SoC DMA / mailbox register words are re-read from shared SRAM/MMIO after header validation."
+      },
+      {
+        "cwe_id": "CWE-1245",
+        "name": "Improper Finite State Machines (FSMs) in Hardware Logic / Firmware Handshake",
+        "rot_manifestation": "Missing hardware status-ready poll or clearing crypto engine lock bit before hardware operation finishes."
+      },
+      {
+        "cwe_id": "CWE-276",
+        "name": "Incorrect Default Permissions (MPU / PMP / KeyVault Lock)",
+        "rot_manifestation": "Misconfiguring PMP/MPU region permissions or failing to set KeyVault slot write-lock bit prior to untrusted runtime jump."
+      },
+      {
+        "cwe_id": "CWE-208",
+        "name": "Observable Timing Discrepancy",
+        "rot_manifestation": "Non-constant-time byte-by-byte tag or HMAC comparison leaking cryptographic secret material across the mailbox interface."
+      }
+    ]
+  }
+}
