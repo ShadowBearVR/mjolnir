@@ -24,6 +24,7 @@
       lib = {
         discoverProjectJobs = import ./nix/discover_project.nix;
         makeJob = import ./nix/orchestrator.nix;
+        makeEvaluation = import ./nix/evaluation.nix;
         makeGroup = import ./nix/group.nix;
       };
 
@@ -127,9 +128,32 @@
             '';
           };
 
+          evaluation-app = pkgs.stdenv.mkDerivation {
+            name = "evaluation-app";
+            src = ./app/evaluation;
+
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
+            installPhase = ''
+              mkdir -p $out/bin $out/lib/evaluation
+              cp -r * $out/lib/evaluation/
+
+              makeWrapper ${pythonEnv}/bin/python3 $out/bin/mjolnir-eval \
+                --add-flags "-m evaluation.main" \
+                --prefix PYTHONPATH : "$out/lib:${mjolnir-app}/lib" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.git pkgs.ripgrep pkgs.universal-ctags pkgs.ast-grep pkgs.bubblewrap pkgs.patch pkgs.gemini-cli pkgs.codex pkgs.semgrep mjolnir-app ]}" \
+                --set GOOGLE_API_USE_CLIENT_CERTIFICATE false
+            '';
+          };
+
           makeJob = { project, job, devShell ? null }: 
             import ./nix/orchestrator.nix {
               inherit pkgs project job devShell mjolnir-app;
+            };
+
+          makeEvaluation = { evaluation, devShell ? null }:
+            import ./nix/evaluation.nix {
+              inherit pkgs evaluation devShell evaluation-app mjolnir-app;
             };
 
           makeGroup = { name, description, jobs }:
@@ -138,6 +162,29 @@
             };
 
           discovered = autodiscoverJobs { inherit pkgs makeJob; };
+
+          caliptraSwShell = import ./evaluations/projects/caliptra-sw/shell.nix { inherit pkgs; };
+          opentitanShell = import ./projects/opentitan/shell.nix { inherit pkgs; };
+
+          eval-caliptra-sw = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-sw/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-caliptra-mcu-sw = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-mcu-sw/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-caliptra-dpe = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-dpe/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-opentitan = makeEvaluation {
+            evaluation = import ./evaluations/projects/opentitan/eval.nix;
+            devShell = opentitanShell;
+          };
 
           web-viewer = pkgs.writeShellApplication {
             name = "mjolnir-web-viewer";
@@ -187,6 +234,11 @@
           discovered // {
             inherit
               mjolnir-app
+              evaluation-app
+              eval-caliptra-sw
+              eval-caliptra-mcu-sw
+              eval-caliptra-dpe
+              eval-opentitan
               web-viewer
               deploy-gcs-web
               deploy-gcs-runs
