@@ -56,6 +56,16 @@ def discover_source_files(
         scan_path = (code_path / s_dir).resolve()
         if not scan_path.exists():
             continue
+        if scan_path.is_file():
+            ext = scan_path.suffix.lstrip(".").lower()
+            if ext in extensions:
+                try:
+                    rel_path = str(scan_path.relative_to(code_path))
+                except ValueError:
+                    rel_path = str(scan_path)
+                if not is_file_excluded(rel_path, exclude_dirs, exclude_patterns):
+                    files_to_scan.append(rel_path)
+            continue
         for root, dirs, files in os.walk(scan_path):
             root_path = Path(root)
             # Skip hidden directories starting with '.' (like .git, .bazel, etc)
