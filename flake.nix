@@ -16,7 +16,10 @@
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       overlays = [ (import rust-overlay) ];
-      nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system overlays; });
+      nixpkgsFor = forAllSystems (system: import nixpkgs {
+        inherit system overlays;
+        config.allowUnfree = true;
+      });
 
       autodiscoverJobs = import ./nix/discovery.nix;
     in
@@ -127,9 +130,32 @@
             '';
           };
 
+          evaluation-app = pkgs.stdenv.mkDerivation {
+            name = "evaluation-app";
+            src = ./app/evaluation;
+
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
+            installPhase = ''
+              mkdir -p $out/bin $out/lib/evaluation
+              cp -r * $out/lib/evaluation/
+
+              makeWrapper ${pythonEnv}/bin/python3 $out/bin/mjolnir-eval \
+                --add-flags "-m evaluation.main" \
+                --prefix PYTHONPATH : "$out/lib:${mjolnir-app}/lib" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.git pkgs.ripgrep pkgs.universal-ctags pkgs.ast-grep pkgs.bubblewrap pkgs.patch pkgs.codex pkgs.semgrep mjolnir-app ]}" \
+                --set GOOGLE_API_USE_CLIENT_CERTIFICATE false
+            '';
+          };
+
           makeJob = { project, job, devShell ? null }: 
             import ./nix/orchestrator.nix {
               inherit pkgs project job devShell mjolnir-app;
+            };
+
+          makeEvaluation = { evaluation, devShell ? null }:
+            import ./nix/evaluation.nix {
+              inherit pkgs evaluation devShell evaluation-app mjolnir-app;
             };
 
           makeGroup = { name, description, jobs }:
@@ -138,6 +164,167 @@
             };
 
           discovered = autodiscoverJobs { inherit pkgs makeJob; };
+
+          caliptraSwShell = import ./evaluations/projects/caliptra-sw/shell.nix { inherit pkgs; };
+          opentitanShell = import ./projects/opentitan/shell.nix { inherit pkgs; };
+          openprotShell = import ./projects/openprot/shell.nix { inherit pkgs; };
+
+          eval-caliptra-sw = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-sw/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-caliptra-mcu-sw = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-mcu-sw/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-caliptra-dpe = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-dpe/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
+          eval-opentitan-fw = makeEvaluation {
+            evaluation = import ./evaluations/projects/opentitan-fw/eval.nix;
+            devShell = opentitanShell;
+          };
+
+          eval-opentitan-rtl = makeEvaluation {
+            evaluation = import ./evaluations/projects/opentitan-rtl/eval.nix;
+            devShell = opentitanShell;
+          };
+
+          eval-opentitan = makeGroup {
+            name = "eval-opentitan";
+            description = "OpenTitan FW & RTL Evaluations";
+            jobs = [
+              eval-opentitan-fw
+              eval-opentitan-rtl
+            ];
+          };
+
+          eval-openprot = makeEvaluation {
+            evaluation = import ./evaluations/projects/openprot/eval.nix;
+            devShell = openprotShell;
+          };
+
+          evalTargets = [
+            eval-caliptra-sw
+            eval-caliptra-mcu-sw
+            eval-caliptra-dpe
+            eval-openprot
+            eval-opentitan-fw
+            eval-opentitan-rtl
+          ];
+
+          eval-all = makeGroup {
+            name = "eval-all";
+            description = "All 6 Pinned RoT Evaluation Targets";
+            jobs = evalTargets;
+          };
+
+          eval-sast = pkgs.writeShellScriptBin "eval-sast" ''
+            set -euo pipefail
+            echo "[BEGIN] Reproducible SAST Baseline Suite (Semgrep + Clippy across all 6 targets)"
+            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
+              echo ""
+              echo ">>> Running SAST baseline target: ${r.name}"
+              ${r}/bin/${r.name} run --tiers sast --repetitions 1 --run-label sast --judge-model heuristic "$@"
+            '') evalTargets}
+            echo ""
+            echo "[END] Reproducible SAST Baseline Suite"
+          '';
+
+          eval-ablation = pkgs.writeShellScriptBin "eval-ablation" ''
+            set -euo pipefail
+            echo "[BEGIN] Reproducible Mjolnir Multi-Checkpoint Ablation Suite (no_tm, no_expert, full across all 6 targets)"
+            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
+              echo ""
+              echo ">>> Running Mjolnir ablation target: ${r.name}"
+              ${r}/bin/${r.name} run --tiers no_tm,no_expert,full --repetitions 3 --run-label pinned "$@"
+            '') evalTargets}
+            echo ""
+            echo "[END] Reproducible Mjolnir Multi-Checkpoint Ablation Suite"
+          '';
+
+          eval-cli = pkgs.writeShellScriptBin "eval-cli" ''
+            set -euo pipefail
+            echo "[BEGIN] Reproducible CLI Agent Baseline Suite (Antigravity CLI across all 6 targets)"
+            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
+              echo ""
+              echo ">>> Running CLI baseline target: ${r.name}"
+              ${r}/bin/${r.name} run --tiers cli_antigravity,cli_antigravity_no_tm,cli_antigravity_per_file,cli_antigravity_per_file_no_tm --repetitions 3 --run-label pinned "$@"
+            '') evalTargets}
+            echo ""
+            echo "[END] Reproducible CLI Agent Baseline Suite"
+          '';
+
+          eval-models = pkgs.writeShellScriptBin "eval-models" ''
+            set -euo pipefail
+            MODELS="''${MJOLNIR_EVAL_MODELS:-gemini-4-argon,vertex_ai/claude-sonnet-4-6}"
+            TARGET="''${MJOLNIR_EVAL_MODEL_TARGET:-caliptra-sw}"
+            echo "[BEGIN] Reproducible Single-Project Multi-Model / Multi-Provider Variance Suite (Target=$TARGET, Models=$MODELS x 3 reps)"
+            case "$TARGET" in
+              caliptra-sw)
+                ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              caliptra-dpe)
+                ${eval-caliptra-dpe}/bin/${eval-caliptra-dpe.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              opentitan-fw)
+                ${eval-opentitan-fw}/bin/${eval-opentitan-fw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              openprot)
+                ${eval-openprot}/bin/${eval-openprot.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              opentitan-rtl)
+                ${eval-opentitan-rtl}/bin/${eval-opentitan-rtl.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              caliptra-mcu-sw)
+                ${eval-caliptra-mcu-sw}/bin/${eval-caliptra-mcu-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                ;;
+              *)
+                echo "Unknown MJOLNIR_EVAL_MODEL_TARGET: $TARGET" >&2
+                exit 1
+                ;;
+            esac
+            echo ""
+            echo "[END] Reproducible Single-Project Multi-Model / Multi-Provider Variance Suite"
+          '';
+
+          eval-stability = pkgs.writeShellScriptBin "eval-stability" ''
+            set -euo pipefail
+            REPS="''${MJOLNIR_EVAL_STABILITY_REPS:-20}"
+            MODEL="''${MJOLNIR_EVAL_STABILITY_MODEL:-gemini-3.8-flash}"
+            TARGET="''${MJOLNIR_EVAL_STABILITY_TARGET:-caliptra-sw}"
+            echo "[BEGIN] Reproducible Deep Stability & Convergence Suite (Target=$TARGET, Model=$MODEL, Reps=$REPS)"
+            case "$TARGET" in
+              caliptra-sw)
+                ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              caliptra-dpe)
+                ${eval-caliptra-dpe}/bin/${eval-caliptra-dpe.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              opentitan-fw)
+                ${eval-opentitan-fw}/bin/${eval-opentitan-fw.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              openprot)
+                ${eval-openprot}/bin/${eval-openprot.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              opentitan-rtl)
+                ${eval-opentitan-rtl}/bin/${eval-opentitan-rtl.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              caliptra-mcu-sw)
+                ${eval-caliptra-mcu-sw}/bin/${eval-caliptra-mcu-sw.name} run --tiers full --evaluator-model "$MODEL" --repetitions "$REPS" --run-label stability "$@"
+                ;;
+              *)
+                echo "Unknown MJOLNIR_EVAL_STABILITY_TARGET: $TARGET" >&2
+                exit 1
+                ;;
+            esac
+            echo ""
+            echo "[END] Reproducible Deep Stability & Convergence Suite"
+          '';
 
           web-viewer = pkgs.writeShellApplication {
             name = "mjolnir-web-viewer";
@@ -187,6 +374,20 @@
           discovered // {
             inherit
               mjolnir-app
+              evaluation-app
+              eval-caliptra-sw
+              eval-caliptra-mcu-sw
+              eval-caliptra-dpe
+              eval-opentitan
+              eval-opentitan-fw
+              eval-opentitan-rtl
+              eval-openprot
+              eval-all
+              eval-sast
+              eval-ablation
+              eval-cli
+              eval-models
+              eval-stability
               web-viewer
               deploy-gcs-web
               deploy-gcs-runs

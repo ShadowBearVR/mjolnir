@@ -23,3 +23,5 @@ output/
 target/
 **/target/
 **/dist/
+# Verilator simulation artifacts
+obj_dir/

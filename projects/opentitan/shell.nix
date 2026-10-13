@@ -185,7 +185,7 @@ if target in content:
 '
     fi
 
-    if [ -f ".gitignore" ] && ! grep -qxF "obj_dir/" .gitignore; then
+    if [ -d "hw/top_earlgrey" ] && [ -f ".gitignore" ] && ! grep -qxF "obj_dir/" .gitignore; then
       printf "\n# Verilator simulation artifacts\nobj_dir/\n" >> .gitignore
     fi
   '';

@@ -1,0 +1,862 @@
+rules:
+- id: c.lang.security.insecure-use-gets-fn.insecure-use-gets-fn
+  pattern: gets(...)
+  message: Avoid 'gets()'. This function does not consider buffer boundaries and can
+    lead to buffer overflows. Use 'fgets()' or 'gets_s()' instead.
+  metadata:
+    cwe:
+    - 'CWE-676: Use of Potentially Dangerous Function'
+    references:
+    - https://us-cert.cisa.gov/bsi/articles/knowledge/coding-practices/fgets-and-gets_s
+    category: security
+    technology:
+    - c
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-gets-fn.insecure-use-gets-fn
+    shortlink: https://sg.run/dKqX
+    semgrep.dev:
+      rule:
+        r_id: 8834
+        rv_id: 945170
+        rule_id: GdU7OE
+        version_id: YDTvRlQ
+        url: https://semgrep.dev/playground/r/YDTvRlQ/c.lang.security.insecure-use-gets-fn.insecure-use-gets-fn
+        origin: community
+  languages:
+  - c
+  severity: ERROR
+- id: c.lang.security.insecure-use-scanf-fn.insecure-use-scanf-fn
+  pattern: scanf(...)
+  message: Avoid using 'scanf()'. This function, when used improperly, does not consider
+    buffer boundaries and can lead to buffer overflows. Use 'fgets()' instead for
+    reading input.
+  metadata:
+    cwe:
+    - 'CWE-676: Use of Potentially Dangerous Function'
+    references:
+    - http://sekrit.de/webdocs/c/beginners-guide-away-from-scanf.html
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-scanf-fn.insecure-use-scanf-fn
+    shortlink: https://sg.run/nd1g
+    semgrep.dev:
+      rule:
+        r_id: 8836
+        rv_id: 945173
+        rule_id: AbUzPd
+        version_id: zyTlkWW
+        url: https://semgrep.dev/playground/r/zyTlkWW/c.lang.security.insecure-use-scanf-fn.insecure-use-scanf-fn
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+- id: c.lang.security.insecure-use-strtok-fn.insecure-use-strtok-fn
+  pattern: strtok(...)
+  message: Avoid using 'strtok()'. This function directly modifies the first argument
+    buffer, permanently erasing the delimiter character. Use 'strtok_r()' instead.
+  metadata:
+    cwe:
+    - 'CWE-676: Use of Potentially Dangerous Function'
+    references:
+    - https://wiki.sei.cmu.edu/confluence/display/c/STR06-C.+Do+not+assume+that+strtok%28%29+leaves+the+parse+string+unchanged
+    - https://man7.org/linux/man-pages/man3/strtok.3.html#BUGS
+    - https://stackoverflow.com/a/40335556
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-strtok-fn.insecure-use-strtok-fn
+    shortlink: https://sg.run/LwqG
+    semgrep.dev:
+      rule:
+        r_id: 8839
+        rv_id: 1028278
+        rule_id: WAUo5v
+        version_id: qkTx1oq
+        url: https://semgrep.dev/playground/r/qkTx1oq/c.lang.security.insecure-use-strtok-fn.insecure-use-strtok-fn
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+- id: c.lang.security.random-fd-exhaustion.random-fd-exhaustion
+  pattern-either:
+  - patterns:
+    - pattern: '$FD = open("/dev/urandom", ...);
+
+        ...
+
+        read($FD, ...);
+
+        '
+    - pattern-not: '$FD = open("/dev/urandom", ...);
+
+        ...
+
+        $BYTES_READ = read($FD, ...);
+
+        '
+  - patterns:
+    - pattern: '$FD = open("/dev/random", ...);
+
+        ...
+
+        read($FD, ...);
+
+        '
+    - pattern-not: '$FD = open("/dev/random", ...);
+
+        ...
+
+        $BYTES_READ = read($FD, ...);
+
+        '
+  message: Call to 'read()' without error checking is susceptible to file descriptor
+    exhaustion. Consider using the 'getrandom()' function.
+  metadata:
+    cwe:
+    - 'CWE-774: Allocation of File Descriptors or Handles Without Limits or Throttling'
+    references:
+    - https://lwn.net/Articles/606141/
+    category: security
+    technology:
+    - c
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Denial-of-Service (DoS)
+    source: https://semgrep.dev/r/c.lang.security.random-fd-exhaustion.random-fd-exhaustion
+    shortlink: https://sg.run/8yNj
+    semgrep.dev:
+      rule:
+        r_id: 8840
+        rv_id: 945177
+        rule_id: 0oU5k4
+        version_id: jQTzvry
+        url: https://semgrep.dev/playground/r/jQTzvry/c.lang.security.random-fd-exhaustion.random-fd-exhaustion
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+- id: generic.unicode.security.bidi.contains-bidirectional-characters
+  patterns:
+  - pattern-either:
+    - pattern-regex: "\u202A"
+    - pattern-regex: "\u202B"
+    - pattern-regex: "\u202D"
+    - pattern-regex: "\u202E"
+    - pattern-regex: "\u2066"
+    - pattern-regex: "\u2067"
+    - pattern-regex: "\u2068"
+    - pattern-regex: "\u202C"
+    - pattern-regex: "\u2069"
+  message: This code contains bidirectional (bidi) characters. While this is useful
+    for support of right-to-left languages such as Arabic or Hebrew, it can also be
+    used to trick language parsers into executing code in a manner that is different
+    from how it is displayed in code editing and review tools. If this is not what
+    you were expecting, please review this code in an editor that can reveal hidden
+    Unicode characters.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    category: security
+    technology:
+    - unicode
+    references:
+    - https://trojansource.codes/
+    confidence: LOW
+    owasp:
+    - A03:2021 - Injection
+    - A05:2025 - Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Code Injection
+    source: https://semgrep.dev/r/generic.unicode.security.bidi.contains-bidirectional-characters
+    shortlink: https://sg.run/nK4r
+    semgrep.dev:
+      rule:
+        r_id: 14880
+        rv_id: 1262904
+        rule_id: d8UeX4
+        version_id: JdTzxzn
+        url: https://semgrep.dev/playground/r/JdTzxzn/generic.unicode.security.bidi.contains-bidirectional-characters
+        origin: community
+  languages:
+  - bash
+  - c
+  - csharp
+  - go
+  - java
+  - javascript
+  - json
+  - kotlin
+  - lua
+  - ocaml
+  - php
+  - python
+  - ruby
+  - rust
+  - scala
+  - sh
+  - typescript
+  - yaml
+  severity: WARNING
+- id: rust.lang.security.reqwest-accept-invalid.reqwest-accept-invalid
+  message: Dangerously accepting invalid TLS information
+  pattern-either:
+  - pattern: reqwest::Client::builder(). ... .danger_accept_invalid_hostnames(true)
+  - pattern: reqwest::Client::builder(). ... .danger_accept_invalid_certs(true)
+  metadata:
+    references:
+    - https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.danger_accept_invalid_hostnames
+    - https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.danger_accept_invalid_certs
+    technology:
+    - reqwest
+    category: security
+    cwe: 'CWE-295: Improper Certificate Validation'
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory: vuln
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Improper Authentication
+    source: https://semgrep.dev/r/rust.lang.security.reqwest-accept-invalid.reqwest-accept-invalid
+    shortlink: https://sg.run/DqrG
+    semgrep.dev:
+      rule:
+        r_id: 40108
+        rv_id: 946551
+        rule_id: qNUKDg
+        version_id: 7ZTrQLJ
+        url: https://semgrep.dev/playground/r/7ZTrQLJ/rust.lang.security.reqwest-accept-invalid.reqwest-accept-invalid
+        origin: community
+  languages:
+  - rust
+  severity: WARNING
+- id: rust.lang.security.rustls-dangerous.rustls-dangerous
+  message: Dangerous client config used, ensure SSL verification
+  pattern-either:
+  - pattern: rustls::client::DangerousClientConfig
+  - pattern: $CLIENT.dangerous().set_certificate_verifier(...)
+  - pattern: 'let $CLIENT = rustls::client::ClientConfig::dangerous(...);
+
+      ...
+
+      $CLIENT.set_certificate_verifier(...);
+
+      '
+  metadata:
+    references:
+    - https://docs.rs/rustls/latest/rustls/client/struct.DangerousClientConfig.html
+    - https://docs.rs/rustls/latest/rustls/client/struct.ClientConfig.html#method.dangerous
+    technology:
+    - rustls
+    category: security
+    cwe: 'CWE-295: Improper Certificate Validation'
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory: vuln
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Improper Authentication
+    source: https://semgrep.dev/r/rust.lang.security.rustls-dangerous.rustls-dangerous
+    shortlink: https://sg.run/01Rw
+    semgrep.dev:
+      rule:
+        r_id: 40110
+        rv_id: 946553
+        rule_id: YGU8LK
+        version_id: 8KTKjdO
+        url: https://semgrep.dev/playground/r/8KTKjdO/rust.lang.security.rustls-dangerous.rustls-dangerous
+        origin: community
+  languages:
+  - rust
+  severity: WARNING
+- id: rust.lang.security.ssl-verify-none.ssl-verify-none
+  message: SSL verification disabled, this allows for MitM attacks
+  pattern: $BUILDER.set_verify(openssl::ssl::SSL_VERIFY_NONE)
+  metadata:
+    references:
+    - https://docs.rs/openssl/latest/openssl/ssl/struct.SslContextBuilder.html#method.set_verify
+    technology:
+    - openssl
+    category: security
+    cwe: 'CWE-295: Improper Certificate Validation'
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory: vuln
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Improper Authentication
+    source: https://semgrep.dev/r/rust.lang.security.ssl-verify-none.ssl-verify-none
+    shortlink: https://sg.run/K2Pn
+    semgrep.dev:
+      rule:
+        r_id: 40111
+        rv_id: 946554
+        rule_id: 6JU0Bl
+        version_id: gETe1bo
+        url: https://semgrep.dev/playground/r/gETe1bo/rust.lang.security.ssl-verify-none.ssl-verify-none
+        origin: community
+  languages:
+  - rust
+  severity: WARNING
+- id: rust.lang.security.args-os.args-os
+  message: 'args_os should not be used for security operations. From the docs: "The
+    first element is traditionally the path of the executable, but it can be set to
+    arbitrary text, and might not even exist. This means this property should not
+    be relied upon for security purposes."'
+  pattern: std::env::args_os()
+  metadata:
+    references:
+    - https://doc.rust-lang.org/stable/std/env/fn.args_os.html
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-807: Reliance on Untrusted Inputs in a Security Decision'
+    confidence: HIGH
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Other
+    source: https://semgrep.dev/r/rust.lang.security.args-os.args-os
+    shortlink: https://sg.run/G6k6
+    semgrep.dev:
+      rule:
+        r_id: 40104
+        rv_id: 946547
+        rule_id: DbUeEe
+        version_id: d6TPjBp
+        url: https://semgrep.dev/playground/r/d6TPjBp/rust.lang.security.args-os.args-os
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: rust.lang.security.args.args
+  message: 'args should not be used for security operations. From the docs: "The first
+    element is traditionally the path of the executable, but it can be set to arbitrary
+    text, and might not even exist. This means this property should not be relied
+    upon for security purposes."'
+  pattern: std::env::args()
+  metadata:
+    references:
+    - https://doc.rust-lang.org/stable/std/env/fn.args.html
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-807: Reliance on Untrusted Inputs in a Security Decision'
+    confidence: HIGH
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Other
+    source: https://semgrep.dev/r/rust.lang.security.args.args
+    shortlink: https://sg.run/RADN
+    semgrep.dev:
+      rule:
+        r_id: 40105
+        rv_id: 946548
+        rule_id: WAU6Lk
+        version_id: ZRT35Ly
+        url: https://semgrep.dev/playground/r/ZRT35Ly/rust.lang.security.args.args
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: rust.lang.security.current-exe.current-exe
+  message: 'current_exe should not be used for security operations. From the docs:
+    "The output of this function should not be trusted for anything that might have
+    security implications. Basically, if users can run the executable, they can change
+    the output arbitrarily."'
+  pattern: std::env::current_exe()
+  metadata:
+    references:
+    - https://doc.rust-lang.org/stable/std/env/fn.current_exe.html#security
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-807: Reliance on Untrusted Inputs in a Security Decision'
+    confidence: HIGH
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Other
+    source: https://semgrep.dev/r/rust.lang.security.current-exe.current-exe
+    shortlink: https://sg.run/AW1B
+    semgrep.dev:
+      rule:
+        r_id: 40106
+        rv_id: 946549
+        rule_id: 0oU6nZ
+        version_id: nWTpz6d
+        url: https://semgrep.dev/playground/r/nWTpz6d/rust.lang.security.current-exe.current-exe
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: rust.lang.security.insecure-hashes.insecure-hashes
+  message: Detected cryptographically insecure hashing function
+  pattern-either:
+  - pattern: md2::Md2::new(...)
+  - pattern: md4::Md4::new(...)
+  - pattern: md5::Md5::new(...)
+  - pattern: sha1::Sha1::new(...)
+  metadata:
+    references:
+    - https://github.com/RustCrypto/hashes
+    - https://docs.rs/md2/latest/md2/
+    - https://docs.rs/md4/latest/md4/
+    - https://docs.rs/md5/latest/md5/
+    - https://docs.rs/sha-1/latest/sha1/
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-328: Use of Weak Hash'
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Insecure Hashing Algorithm
+    source: https://semgrep.dev/r/rust.lang.security.insecure-hashes.insecure-hashes
+    shortlink: https://sg.run/B09R
+    semgrep.dev:
+      rule:
+        r_id: 40107
+        rv_id: 946550
+        rule_id: KxUOxA
+        version_id: ExTg29b
+        url: https://semgrep.dev/playground/r/ExTg29b/rust.lang.security.insecure-hashes.insecure-hashes
+        origin: community
+  languages:
+  - rust
+  severity: WARNING
+- id: rust.lang.security.reqwest-set-sensitive.reqwest-set-sensitive
+  message: Set sensitive flag on security headers with 'set_sensitive' to treat data
+    with special care
+  patterns:
+  - pattern: 'let mut $HEADERS = header::HeaderMap::new();
+
+      ...
+
+      let $HEADER_VALUE = <... header::HeaderValue::$FROM_FUNC(...) ...>;
+
+      ...
+
+      $HEADERS.insert($HEADER, $HEADER_VALUE);
+
+      '
+  - pattern-not: 'let mut $HEADERS = header::HeaderMap::new();
+
+      ...
+
+      let $HEADER_VALUE = <... header::HeaderValue::$FROM_FUNC(...) ...>;
+
+      ...
+
+      $HEADER_VALUE.set_sensitive(true);
+
+      ...
+
+      $HEADERS.insert($HEADER, $HEADER_VALUE);
+
+      '
+  - metavariable-pattern:
+      metavariable: $FROM_FUNC
+      pattern-either:
+      - pattern: from_static
+      - pattern: from_str
+      - pattern: from_name
+      - pattern: from_bytes
+      - pattern: from_maybe_shared
+  - metavariable-pattern:
+      metavariable: $HEADER
+      pattern-either:
+      - pattern: header::AUTHORIZATION
+      - pattern: '"Authorization"'
+  metadata:
+    references:
+    - https://docs.rs/reqwest/latest/reqwest/header/struct.HeaderValue.html#method.set_sensitive
+    technology:
+    - reqwest
+    category: security
+    cwe: 'CWE-921: Storage of Sensitive Data in a Mechanism without Access Control'
+    confidence: MEDIUM
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Other
+    source: https://semgrep.dev/r/rust.lang.security.reqwest-set-sensitive.reqwest-set-sensitive
+    shortlink: https://sg.run/WKlE
+    semgrep.dev:
+      rule:
+        r_id: 40109
+        rv_id: 946552
+        rule_id: lBUNEw
+        version_id: LjTXy1d
+        url: https://semgrep.dev/playground/r/LjTXy1d/rust.lang.security.reqwest-set-sensitive.reqwest-set-sensitive
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: rust.lang.security.temp-dir.temp-dir
+  message: "temp_dir should not be used for security operations. From the docs: 'The\
+    \ temporary directory may be shared among users, or between processes with different\
+    \ privileges; thus, the creation of any files or directories in the temporary\
+    \ directory must use a secure method to create a uniquely named file. Creating\
+    \ a file or directory with a fixed or predictable name may result in \u201Cinsecure\
+    \ temporary file\u201D security vulnerabilities.'"
+  pattern: std::env::temp_dir()
+  metadata:
+    references:
+    - https://doc.rust-lang.org/stable/std/env/fn.temp_dir.html
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-807: Reliance on Untrusted Inputs in a Security Decision'
+    confidence: HIGH
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Other
+    source: https://semgrep.dev/r/rust.lang.security.temp-dir.temp-dir
+    shortlink: https://sg.run/qzEO
+    semgrep.dev:
+      rule:
+        r_id: 40112
+        rv_id: 946555
+        rule_id: oqU5AO
+        version_id: QkTZz4Y
+        url: https://semgrep.dev/playground/r/QkTZz4Y/rust.lang.security.temp-dir.temp-dir
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: rust.lang.security.unsafe-usage.unsafe-usage
+  message: Detected 'unsafe' usage, please audit for secure usage
+  pattern: unsafe { ... }
+  metadata:
+    references:
+    - https://doc.rust-lang.org/std/keyword.unsafe.html
+    technology:
+    - rust
+    category: security
+    cwe: 'CWE-242: Use of Inherently Dangerous Function'
+    confidence: HIGH
+    likelihood: LOW
+    impact: LOW
+    subcategory: audit
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/rust.lang.security.unsafe-usage.unsafe-usage
+    shortlink: https://sg.run/lqgo
+    semgrep.dev:
+      rule:
+        r_id: 40113
+        rv_id: 946556
+        rule_id: zdUezd
+        version_id: 3ZTOPoZ
+        url: https://semgrep.dev/playground/r/3ZTOPoZ/rust.lang.security.unsafe-usage.unsafe-usage
+        origin: community
+  languages:
+  - rust
+  severity: INFO
+- id: c.lang.security.insecure-use-printf-fn.insecure-use-printf-fn
+  message: Avoid using user-controlled format strings passed into 'sprintf', 'printf'
+    and 'vsprintf'. These functions put you at risk of buffer overflow vulnerabilities
+    through the use of format string exploits. Instead, use 'snprintf' and 'vsnprintf'.
+  metadata:
+    cwe:
+    - 'CWE-134: Use of Externally-Controlled Format String'
+    references:
+    - https://doc.castsoftware.com/display/SBX/Never+use+sprintf%28%29+or+vsprintf%28%29+functions
+    - https://www.cvedetails.com/cwe-details/134/Uncontrolled-Format-String.html
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Improper Validation
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-printf-fn.insecure-use-printf-fn
+    shortlink: https://sg.run/ZvJx
+    semgrep.dev:
+      rule:
+        r_id: 8835
+        rv_id: 945172
+        rule_id: ReUgWx
+        version_id: o5TZeB2
+        url: https://semgrep.dev/playground/r/o5TZeB2/c.lang.security.insecure-use-printf-fn.insecure-use-printf-fn
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$FUNC($BUFFER, argv[$NUM], ...);
+
+        ...
+
+        vsprintf(..., $BUFFER, ...);
+
+        '
+    - pattern: vsprintf(..., argv[$NUM], ...)
+    - pattern: '$FUNC($BUFFER, argv[$NUM], ...);
+
+        ...
+
+        sprintf(..., $BUFFER, ...);
+
+        '
+    - pattern: sprintf(...,argv[$NUM],...)
+    - pattern: '$FUNC($BUFFER, argv[$NUM], ...);
+
+        ...
+
+        printf(..., $BUFFER, ...);
+
+        '
+    - pattern: printf(...,argv[$NUM],...)
+  - metavariable-comparison:
+      metavariable: $NUM
+      comparison: int($NUM) > 0
+- id: c.lang.security.insecure-use-strcat-fn.insecure-use-strcat-fn
+  pattern-either:
+  - pattern: strcat(...)
+  - pattern: strncat(...)
+  message: Finding triggers whenever there is a strcat or strncat used. This is an
+    issue because strcat or strncat can lead to buffer overflow vulns. Fix this by
+    using strcat_s instead.
+  metadata:
+    cwe:
+    - 'CWE-676: Use of Potentially Dangerous Function'
+    references:
+    - https://nvd.nist.gov/vuln/detail/CVE-2019-12553
+    - https://techblog.mediaservice.net/2020/04/cve-2020-2851-stack-based-buffer-overflow-in-cde-libdtsvc/
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-strcat-fn.insecure-use-strcat-fn
+    shortlink: https://sg.run/EkRP
+    semgrep.dev:
+      rule:
+        r_id: 8837
+        rv_id: 945174
+        rule_id: BYUNjA
+        version_id: pZTNOXb
+        url: https://semgrep.dev/playground/r/pZTNOXb/c.lang.security.insecure-use-strcat-fn.insecure-use-strcat-fn
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+- id: c.lang.security.double-free.double-free
+  patterns:
+  - pattern-not: 'free($VAR);
+
+      ...
+
+      $VAR = NULL;
+
+      ...
+
+      free($VAR);
+
+      '
+  - pattern-not: 'free($VAR);
+
+      ...
+
+      $VAR = malloc(...);
+
+      ...
+
+      free($VAR);
+
+      '
+  - pattern-inside: 'free($VAR);
+
+      ...
+
+      $FREE($VAR);
+
+      '
+  - metavariable-pattern:
+      metavariable: $FREE
+      pattern: free
+  - focus-metavariable: $FREE
+  message: Variable '$VAR' was freed twice. This can lead to undefined behavior.
+  metadata:
+    cwe:
+    - 'CWE-415: Double Free'
+    owasp:
+    - A03:2021 - Injection
+    - A01:2017 - Injection
+    - A05:2025 - Injection
+    references:
+    - https://cwe.mitre.org/data/definitions/415.html
+    - https://owasp.org/www-community/vulnerabilities/Doubly_freeing_memory
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Memory Issues
+    source: https://semgrep.dev/r/c.lang.security.double-free.double-free
+    shortlink: https://sg.run/eLl0
+    semgrep.dev:
+      rule:
+        r_id: 8832
+        rv_id: 1262604
+        rule_id: JDUyw8
+        version_id: RGT0L3W
+        url: https://semgrep.dev/playground/r/RGT0L3W/c.lang.security.double-free.double-free
+        origin: community
+  languages:
+  - c
+  severity: ERROR
+- id: c.lang.security.use-after-free.use-after-free
+  patterns:
+  - pattern-either:
+    - pattern: $VAR->$ACCESSOR
+    - pattern: (*$VAR).$ACCESSOR
+    - pattern: $VAR[$NUM]
+  - pattern-inside: free($VAR); ...
+  - pattern-not-inside: $VAR = NULL; ...
+  - pattern-not-inside: free($VAR); ... $VAR = malloc(...); ...
+  message: Variable '$VAR' was used after being freed. This can lead to undefined
+    behavior.
+  metadata:
+    cwe:
+    - 'CWE-416: Use After Free'
+    references:
+    - https://cwe.mitre.org/data/definitions/416.html
+    - https://ctf-wiki.github.io/ctf-wiki/pwn/linux/glibc-heap/use_after_free/
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Memory Issues
+    source: https://semgrep.dev/r/c.lang.security.use-after-free.use-after-free
+    shortlink: https://sg.run/gL6e
+    semgrep.dev:
+      rule:
+        r_id: 8841
+        rv_id: 945178
+        rule_id: KxUb9l
+        version_id: 1QToKPy
+        url: https://semgrep.dev/playground/r/1QToKPy/c.lang.security.use-after-free.use-after-free
+        origin: community
+  languages:
+  - c
+  severity: WARNING
+- id: c.lang.security.insecure-use-string-copy-fn.insecure-use-string-copy-fn
+  pattern-either:
+  - pattern: strcpy(...)
+  - pattern: strncpy(...)
+  message: Finding triggers whenever there is a strcpy or strncpy used. This is an
+    issue because strcpy does not affirm the size of the destination array and strncpy
+    will not automatically NULL-terminate strings. This can lead to buffer overflows,
+    which can cause program crashes and potentially let an attacker inject code in
+    the program. Fix this by using strcpy_s instead (although note that strcpy_s is
+    an optional part of the C11 standard, and so may not be available).
+  metadata:
+    cwe:
+    - 'CWE-676: Use of Potentially Dangerous Function'
+    references:
+    - https://cwe.mitre.org/data/definitions/676
+    - https://nvd.nist.gov/vuln/detail/CVE-2019-11365
+    category: security
+    technology:
+    - c
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    license: Semgrep Rules License v1.0. For more details, visit semgrep.dev/legal/rules-license
+    vulnerability_class:
+    - Dangerous Method or Function
+    source: https://semgrep.dev/r/c.lang.security.insecure-use-string-copy-fn.insecure-use-string-copy-fn
+    shortlink: https://sg.run/7oNk
+    semgrep.dev:
+      rule:
+        r_id: 8838
+        rv_id: 945175
+        rule_id: DbUpo5
+        version_id: 2KTYb7Y
+        url: https://semgrep.dev/playground/r/2KTYb7Y/c.lang.security.insecure-use-string-copy-fn.insecure-use-string-copy-fn
+        origin: community
+  languages:
+  - c
+  severity: WARNING
