@@ -23,7 +23,7 @@ let
       testCmd = evalCfg.testCmd or null;
       lintCmd = evalCfg.lintCmd or null;
       cliTemplates = evalCfg.cliTemplates or {
-        antigravity = "${pkgs.antigravity}/bin/antigravity -p {prompt} --dangerously-skip-permissions";
+        antigravity = "antigravity -p {prompt} --dangerously-skip-permissions";
       };
       scopes = evalCfg.scopes or [
         {
@@ -43,12 +43,12 @@ let
 
   specFile = pkgs.writeText "mjolnir-eval-spec-${evalCfg.repoName}.json" (builtins.toJSON spec);
 
-  shellInputs = [ pkgs.antigravity ] ++ (if devShell != null then
+  shellInputs = if devShell != null then
     (devShell.nativeBuildInputs or []) ++
     (devShell.buildInputs or []) ++
     (devShell.propagatedBuildInputs or []) ++
     (if devShell ? outPath then [ devShell ] else [])
-  else []);
+  else [];
 
   shellBinPath = pkgs.lib.makeBinPath shellInputs;
   shellHook = if devShell != null && devShell ? shellHook then devShell.shellHook else "";

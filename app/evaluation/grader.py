@@ -501,24 +501,32 @@ class FindingPooler:
                 root_identity = (base_tier, trial.repetition, root_fid)
 
                 matched_idx = None
-                for idx, (canon, _occs, run_ids) in enumerate(clusters):
+                for idx, (_canon, _occs, run_ids) in enumerate(clusters):
                     if (finding_id and run_identity in run_ids) or (
                         root_fid and root_identity in run_ids
                     ):
                         matched_idx = idx
                         break
-                    if self._findings_equivalent(
-                        canon=canon,
-                        file_path=raw_file,
-                        loc_str=loc_str,
-                        start_ln=start_ln,
-                        end_ln=end_ln,
-                        cwe_str=cwe_str,
-                        title_str=title_str,
-                        desc_str=desc_str,
-                    ):
-                        matched_idx = idx
-                        break
+
+                if matched_idx is None:
+                    is_mjolnir_run = base_tier.split("[")[0] in ("full", "no_tm", "no_expert")
+                    for idx, (canon, _occs, run_ids) in enumerate(clusters):
+                        if is_mjolnir_run and any(
+                            b == base_tier and r == trial.repetition for (b, r, _) in run_ids
+                        ):
+                            continue
+                        if self._findings_equivalent(
+                            canon=canon,
+                            file_path=raw_file,
+                            loc_str=loc_str,
+                            start_ln=start_ln,
+                            end_ln=end_ln,
+                            cwe_str=cwe_str,
+                            title_str=title_str,
+                            desc_str=desc_str,
+                        ):
+                            matched_idx = idx
+                            break
 
                 if matched_idx is not None:
                     canon, occs, run_ids = clusters[matched_idx]
@@ -645,8 +653,19 @@ class FindingPooler:
             if (canon.start_line - margin) <= f_end and (start_ln - margin) <= c_end:
                 span_overlap = True
 
-        loc_tokens_a = keyword_tokens(canon.location) - {"line", "lines", "function"}
-        loc_tokens_b = keyword_tokens(loc_str) - {"line", "lines", "function"}
+        file_tokens = keyword_tokens(file_path) | {
+            "line",
+            "lines",
+            "function",
+            "rs",
+            "sv",
+            "c",
+            "h",
+            "cpp",
+            "py",
+        }
+        loc_tokens_a = keyword_tokens(canon.location) - file_tokens
+        loc_tokens_b = keyword_tokens(loc_str) - file_tokens
         shared_func = bool(loc_tokens_a and loc_tokens_b and (loc_tokens_a & loc_tokens_b))
 
         cwe_equiv = bool(
@@ -657,12 +676,7 @@ class FindingPooler:
         kw_jaccard = (len(toks_a & toks_b) / len(toks_a | toks_b)) if (toks_a and toks_b) else 0.0
 
         if not span_overlap and not shared_func:
-            if (
-                canon.start_line is not None
-                and start_ln is not None
-                and not cwe_equiv
-                and kw_jaccard < 0.25
-            ):
+            if not cwe_equiv and kw_jaccard < 0.25:
                 return False
 
         # Step 2: Semantic Root-Cause Equivalence

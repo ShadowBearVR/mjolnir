@@ -389,6 +389,7 @@ class EvaluationRunner:
         repetitions: int = 1,
         expand_checkpoints: bool = True,
         run_label: str = "pinned",
+        force_rerun: bool = False,
     ) -> list[TrialRunRecord]:
         """Runs the specified evaluation tiers and repetitions against the pinned project source tree."""
         repo_name = self.project["repoName"]
@@ -422,6 +423,17 @@ class EvaluationRunner:
         # Load any existing trials so incremental runs across tiers accumulate cleanly
         manifest_path = eval_out_dir / "trials_manifest.json"
         existing_by_key: dict[tuple[str, int], TrialRunRecord] = {}
+        if run_label == "stability" and not force_rerun:
+            pinned_manifest = self.output_root / repo_name / "pinned" / "trials_manifest.json"
+            if pinned_manifest.exists():
+                try:
+                    for item in json.loads(pinned_manifest.read_text(encoding="utf-8")):
+                        rec = TrialRunRecord.model_validate(item)
+                        if rec.ablation_tier == "full" or rec.ablation_tier.startswith("full@"):
+                            existing_by_key[(rec.ablation_tier, rec.repetition)] = rec
+                except Exception as e:
+                    logger.warning(f"Could not seed stability manifest from pinned: {e}")
+
         if manifest_path.exists():
             try:
                 raw_prev = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -464,6 +476,44 @@ class EvaluationRunner:
 
                 for rep in range(1, repetitions + 1):
                     model_note = f" | Model={model_id}" if model_id else ""
+                    cached_rec = existing_by_key.get((eff_tier_key, rep))
+                    if (
+                        not force_rerun
+                        and cached_rec is not None
+                        and cached_rec.exit_code == 0
+                        and Path(cached_rec.findings_path).exists()
+                    ):
+                        logger.info(
+                            f"Skipping already-completed trial: Tier={eff_tier_key} ({eff_tier_name}){model_note} | Rep {rep}/{repetitions} (cached in {manifest_path.name})"
+                        )
+                        continue
+
+                    # If running multi-model suite and the default model already completed unqualified (e.g. 'full'), reuse it
+                    if (
+                        not force_rerun
+                        and qualify_model
+                        and model_id == self.default_model
+                        and (base_tier_key, rep) in existing_by_key
+                        and existing_by_key[(base_tier_key, rep)].exit_code == 0
+                        and Path(existing_by_key[(base_tier_key, rep)].findings_path).exists()
+                    ):
+                        logger.info(
+                            f"Reusing completed default-model trial '{base_tier_key}' (Rep {rep}) for '{eff_tier_key}' without re-running LLM."
+                        )
+                        for (k_tier, k_rep), prev_rec in list(existing_by_key.items()):
+                            if k_rep == rep and (
+                                k_tier == base_tier_key or k_tier.startswith(f"{base_tier_key}@")
+                            ):
+                                suffix = k_tier[len(base_tier_key) :]
+                                aliased_tier = f"{eff_tier_key}{suffix}"
+                                existing_by_key[(aliased_tier, rep)] = prev_rec.model_copy(
+                                    update={
+                                        "trial_id": f"{prev_rec.trial_id}_{format_model_slug(model_id)}",
+                                        "ablation_tier": aliased_tier,
+                                    }
+                                )
+                        continue
+
                     logger.header(
                         f"Evaluating {repo_name} ({pinned_rev[:12]}) | Tier={eff_tier_key} ({eff_tier_name}){model_note} | Rep {rep}/{repetitions}"
                     )
@@ -594,7 +644,11 @@ class EvaluationRunner:
             if archive_dir.exists():
                 shutil.rmtree(archive_dir)
             archive_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(trial_out_dir, archive_dir)
+            shutil.copytree(
+                trial_out_dir,
+                archive_dir,
+                ignore=shutil.ignore_patterns(".cargo_target_cache", "poc_worktrees"),
+            )
 
             primary_record = self._build_trial_record(
                 ablation_tier=tier_key,

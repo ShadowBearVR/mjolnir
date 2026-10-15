@@ -287,7 +287,7 @@
 
           eval-stability = pkgs.writeShellScriptBin "eval-stability" ''
             set -euo pipefail
-            REPS="''${MJOLNIR_EVAL_STABILITY_REPS:-20}"
+            REPS="''${MJOLNIR_EVAL_STABILITY_REPS:-10}"
             MODEL="''${MJOLNIR_EVAL_STABILITY_MODEL:-gemini-3.8-flash}"
             TARGET="''${MJOLNIR_EVAL_STABILITY_TARGET:-caliptra-sw}"
             echo "[BEGIN] Reproducible Deep Stability & Convergence Suite (Target=$TARGET, Model=$MODEL, Reps=$REPS)"

@@ -81,6 +81,6 @@ in
   ];
 
   cliTemplates = {
-    antigravity = "${pkgs.antigravity}/bin/antigravity -p {prompt} --dangerously-skip-permissions";
+    antigravity = "antigravity -p {prompt} --dangerously-skip-permissions";
   };
 }

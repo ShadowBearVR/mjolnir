@@ -56,6 +56,11 @@ def _add_run_arguments(p: argparse.ArgumentParser) -> None:
         help="Disable automatic extraction of per-phase history checkpoints (@discovery, @deduplication, etc.)",
     )
     p.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="Re-execute trials even if a successful (tier, repetition) record already exists in trials_manifest.json",
+    )
+    p.add_argument(
         "--output-dir",
         help="Override evaluation output directory",
     )
@@ -166,6 +171,7 @@ def main() -> None:
             repetitions=args.repetitions,
             expand_checkpoints=not args.no_expand_checkpoints,
             run_label=args.run_label,
+            force_rerun=args.force_rerun,
         )
         if trials:
             eval_dir = output_root / spec["project"]["repoName"] / args.run_label
