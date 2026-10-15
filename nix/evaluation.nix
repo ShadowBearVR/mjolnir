@@ -69,7 +69,7 @@ let
     ''}
 
     if [ "$#" -eq 0 ]; then
-      set -- run --tiers no_tm,no_expert,full --repetitions 3 --run-label pinned
+      set -- run --tiers "${evalCfg.defaultTiers or (if evalCfg.repoName == "caliptra-sw" then "no_tm,no_expert,full" else "full")}" --repetitions ${toString (evalCfg.defaultRepetitions or 3)} --run-label pinned
     fi
 
     exec ${evaluation-app}/bin/mjolnir-eval --spec "${specFile}" "$@"

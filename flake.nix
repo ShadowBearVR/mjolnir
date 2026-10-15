@@ -225,24 +225,20 @@
 
           eval-ablation = pkgs.writeShellScriptBin "eval-ablation" ''
             set -euo pipefail
-            echo "[BEGIN] Reproducible Mjolnir Multi-Checkpoint Ablation Suite (no_tm, no_expert, full x 3 reps across all 6 targets)"
-            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
-              echo ""
-              echo ">>> Running Mjolnir ablation target: ${r.name}"
-              ${r}/bin/${r.name} run --tiers no_tm,no_expert,full --repetitions 3 --run-label pinned "$@"
-            '') evalTargets}
+            echo "[BEGIN] Reproducible Mjolnir Multi-Checkpoint Ablation Suite (caliptra-sw: no_tm, no_expert, full x 3 reps)"
+            echo ""
+            echo ">>> Running Mjolnir ablation target: ${eval-caliptra-sw.name}"
+            ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers no_tm,no_expert,full --repetitions 3 --run-label pinned "$@"
             echo ""
             echo "[END] Reproducible Mjolnir Multi-Checkpoint Ablation Suite"
           '';
 
           eval-cli = pkgs.writeShellScriptBin "eval-cli" ''
             set -euo pipefail
-            echo "[BEGIN] Reproducible CLI Agent Baseline Suite (Antigravity CLI 4 modes x 3 reps across all 6 targets)"
-            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
-              echo ""
-              echo ">>> Running CLI baseline target: ${r.name}"
-              ${r}/bin/${r.name} run --tiers cli_antigravity,cli_antigravity_no_tm,cli_antigravity_per_file,cli_antigravity_per_file_no_tm --repetitions 3 --run-label pinned "$@"
-            '') evalTargets}
+            echo "[BEGIN] Reproducible CLI Agent Baseline Suite (caliptra-sw: Antigravity CLI 4 modes x 3 reps)"
+            echo ""
+            echo ">>> Running CLI baseline target: ${eval-caliptra-sw.name}"
+            ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers cli_antigravity,cli_antigravity_no_tm,cli_antigravity_per_file,cli_antigravity_per_file_no_tm --repetitions 3 --run-label pinned "$@"
             echo ""
             echo "[END] Reproducible CLI Agent Baseline Suite"
           '';
