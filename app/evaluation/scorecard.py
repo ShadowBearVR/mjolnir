@@ -13,6 +13,7 @@ from evaluation.constants import ABLATION_TIERS
 from evaluation.grader import FindingPooler, compute_inter_rater_stats
 from evaluation.models import (
     CanonicalFinding,
+    CrossModelConsistencySummary,
     FindingOccurrence,
     FindingPoolMapping,
     InterRaterStats,
@@ -102,8 +103,15 @@ class ScorecardGenerator:
                 )
             )
 
+        cross_model = self._compute_cross_model_consistency(
+            summaries=summaries,
+            canon_by_id=canon_by_id,
+            occs_by_trial=occs_by_trial,
+        )
+
         payload = {
             "inter_rater_stats": inter_rater.model_dump(),
+            "cross_model_consistency": cross_model.model_dump() if cross_model else None,
             "tiers": [s.model_dump() for s in summaries],
         }
         (out_dir / "scorecard.json").write_text(
@@ -111,11 +119,11 @@ class ScorecardGenerator:
             encoding="utf-8",
         )
         (out_dir / "scorecard.md").write_text(
-            self._render_markdown(summaries, inter_rater),
+            self._render_markdown(summaries, inter_rater, cross_model),
             encoding="utf-8",
         )
         (out_dir / "scorecard_tables.tex").write_text(
-            self._render_latex_booktabs(summaries, inter_rater),
+            self._render_latex_booktabs(summaries, inter_rater, cross_model),
             encoding="utf-8",
         )
 
@@ -138,6 +146,8 @@ class ScorecardGenerator:
         base_tier = tier_key.split("@")[0]
 
         open_counts: list[float] = []
+        unique_rca_counts: list[float] = []
+        redundant_dup_counts: list[float] = []
         tp_counts: list[float] = []
         fp_counts: list[float] = []
         unlabeled_counts: list[float] = []
@@ -201,9 +211,13 @@ class ScorecardGenerator:
             n_fp = len(fp_cids)
             n_labeled_open = n_tp + n_fp
             n_open = trial.open_findings_count
+            n_unique_rca = len(open_cids)
+            n_redundant_dup = max(0, n_open - n_unique_rca)
             n_poc = trial.poc_verified_count
 
             open_counts.append(float(n_open))
+            unique_rca_counts.append(float(n_unique_rca))
+            redundant_dup_counts.append(float(n_redundant_dup))
             tp_counts.append(float(n_tp))
             fp_counts.append(float(n_fp))
             unlabeled_counts.append(float(len(unlabeled_cids)))
@@ -336,6 +350,12 @@ class ScorecardGenerator:
             for cid, cnt in sorted(open_freq.items(), key=lambda x: (-x[1], x[0]))
         }
 
+        mean_open = statistics.fmean(open_counts) if open_counts else 0.0
+        mean_unique_rca = statistics.fmean(unique_rca_counts) if unique_rca_counts else 0.0
+        mean_redundant_dups = (
+            statistics.fmean(redundant_dup_counts) if redundant_dup_counts else 0.0
+        )
+        redundancy_ratio = round(mean_open / mean_unique_rca, 2) if mean_unique_rca > 0 else 1.0
         mean_tp = statistics.fmean(tp_counts) if tp_counts else 0.0
         mean_tok = statistics.fmean(run_tokens) if run_tokens else 0.0
         tokens_per_tp = round(mean_tok / mean_tp, 1) if mean_tp > 0 else None
@@ -357,10 +377,13 @@ class ScorecardGenerator:
             model=model_str,
             repetitions=len(tier_trials),
             total_pooled_tps=total_pooled_tps,
-            mean_open_findings=round(statistics.fmean(open_counts), 2) if open_counts else 0.0,
+            mean_open_findings=round(mean_open, 2),
             std_open_findings=round(
                 statistics.stdev(open_counts) if len(open_counts) > 1 else 0.0, 2
             ),
+            mean_unique_root_causes=round(mean_unique_rca, 2),
+            mean_redundant_duplicates=round(mean_redundant_dups, 2),
+            redundancy_ratio=redundancy_ratio,
             mean_true_positives=round(mean_tp, 2),
             std_true_positives=round(statistics.stdev(tp_counts) if len(tp_counts) > 1 else 0.0, 2),
             unique_open_across_reps=unique_open_across_reps,
@@ -410,8 +433,89 @@ class ScorecardGenerator:
             finding_detection_frequencies=finding_detection_frequencies,
         )
 
+    def _compute_cross_model_consistency(
+        self,
+        summaries: list[TierEvaluationSummary],
+        canon_by_id: dict[str, CanonicalFinding],
+        occs_by_trial: dict[tuple[str, int], list[tuple[str, FindingOccurrence]]],
+    ) -> CrossModelConsistencySummary | None:
+        """Computes cross-model / cross-provider root-cause overlap and consensus when >=2 models exist."""
+        primary = [s for s in summaries if "@" not in s.ablation_tier and s.model]
+        # Prefer comparing identical base tiers across different models (e.g. full[modelA] vs full[modelB])
+        full_tiers = [s for s in primary if re.sub(r"\[.*\]$", "", s.ablation_tier) == "full"]
+        candidates = full_tiers if len({s.model for s in full_tiers}) >= 2 else primary
+        unique_models = sorted({s.model for s in candidates if s.model})
+        if len(unique_models) < 2:
+            return None
+
+        open_by_model: dict[str, set[str]] = defaultdict(set)
+        tp_by_model: dict[str, set[str]] = defaultdict(set)
+        for s in candidates:
+            for rep in range(1, s.repetitions + 1):
+                for cid, occ in occs_by_trial.get((s.ablation_tier, rep), []):
+                    if occ.status.lower() != "open":
+                        continue
+                    open_by_model[s.model].add(cid)
+                    cf = canon_by_id.get(cid)
+                    if cf and cf.resolved_label == "TP":
+                        tp_by_model[s.model].add(cid)
+
+        all_open = set().union(*open_by_model.values()) if open_by_model else set()
+        all_tp = set().union(*tp_by_model.values()) if tp_by_model else set()
+
+        consensus_all_open = (
+            len(set.intersection(*(open_by_model[m] for m in unique_models)))
+            if unique_models
+            else 0
+        )
+        consensus_maj_open = sum(
+            1 for cid in all_open if sum(1 for m in unique_models if cid in open_by_model[m]) >= 2
+        )
+        consensus_all_tp = (
+            len(set.intersection(*(tp_by_model[m] for m in unique_models))) if unique_models else 0
+        )
+        consensus_maj_tp = sum(
+            1 for cid in all_tp if sum(1 for m in unique_models if cid in tp_by_model[m]) >= 2
+        )
+
+        pairwise_open: dict[str, float] = {}
+        pairwise_tp: dict[str, float] = {}
+        for i in range(len(unique_models)):
+            for j in range(i + 1, len(unique_models)):
+                m1, m2 = unique_models[i], unique_models[j]
+                pair_key = f"{m1} vs {m2}"
+                u_open = len(open_by_model[m1] | open_by_model[m2])
+                pairwise_open[pair_key] = round(
+                    len(open_by_model[m1] & open_by_model[m2]) / u_open if u_open > 0 else 1.0, 4
+                )
+                u_tp = len(tp_by_model[m1] | tp_by_model[m2])
+                pairwise_tp[pair_key] = round(
+                    len(tp_by_model[m1] & tp_by_model[m2]) / u_tp if u_tp > 0 else 1.0, 4
+                )
+
+        return CrossModelConsistencySummary(
+            models=unique_models,
+            total_unique_open_across_models=len(all_open),
+            consensus_all_models_open=consensus_all_open,
+            consensus_majority_models_open=consensus_maj_open,
+            total_unique_tps_across_models=len(all_tp),
+            consensus_all_models_tp=consensus_all_tp,
+            consensus_majority_models_tp=consensus_maj_tp,
+            pairwise_open_jaccard=pairwise_open,
+            pairwise_tp_jaccard=pairwise_tp,
+            mean_cross_model_open_jaccard=round(statistics.fmean(pairwise_open.values()), 4)
+            if pairwise_open
+            else 0.0,
+            mean_cross_model_tp_jaccard=round(statistics.fmean(pairwise_tp.values()), 4)
+            if pairwise_tp
+            else 0.0,
+        )
+
     def _render_markdown(
-        self, summaries: list[TierEvaluationSummary], inter_rater: InterRaterStats
+        self,
+        summaries: list[TierEvaluationSummary],
+        inter_rater: InterRaterStats,
+        cross_model: CrossModelConsistencySummary | None = None,
     ) -> str:
         lines = [
             "# Mjolnir Real-World Evaluation Scorecard",
@@ -424,15 +528,16 @@ class ScorecardGenerator:
             f"- **Double-Reviewed Findings**: `{inter_rater.double_reviewed_count}` "
             f"| **Raw Agreement**: `{inter_rater.raw_agreement_rate:.1%}` | **Cohen's Kappa ($\\kappa$)**: `{inter_rater.cohens_kappa:.3f}`",
             "",
-            "## 2. RQ1 & RQ3: Configuration & Baseline Comparison",
+            "## 2. RQ1, RQ2 & RQ4: Quality, Redundancy & Token Cost Comparison",
             "",
-            "| Tier | Mean Open | TPs | FPs | PoC Verified | Precision | Pooled Recall | False Disproof | FP Elim. | Tokens/Run | Tokens/TP | Time (s) |",
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            "| Tier | Mean Open | Unique RCAs | Redundancy | TPs | FPs | PoC Verified | Precision | Pooled Recall | False Disproof | FP Elim. | Tokens/Run | Tokens/TP | Time (s) |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
         for s in summaries:
             tok_tp_str = f"{s.tokens_per_tp:,.0f}" if s.tokens_per_tp is not None else "N/A"
             lines.append(
-                f"| **{s.tier_name}** | {s.mean_open_findings:.1f} | {s.mean_true_positives:.1f} "
+                f"| **{s.tier_name}** | {s.mean_open_findings:.1f} | {s.mean_unique_root_causes:.1f} "
+                f"| {s.redundancy_ratio:.2f}x | {s.mean_true_positives:.1f} "
                 f"| {s.mean_false_positives:.1f} | {s.mean_poc_verified:.1f} "
                 f"| {s.precision_mean:.1%} | {s.pooled_recall_mean:.1%} "
                 f"| {s.false_disproof_rate_mean:.1%} | {s.fp_elimination_rate_mean:.1%} "
@@ -446,7 +551,7 @@ class ScorecardGenerator:
             lines.extend(
                 [
                     "",
-                    "## 3. RQ2: Phase-Transition Verification Funnel & Severity Shifts",
+                    "## 3. RQ2: Phase-Transition Verification Funnel, Redundancy Collapse & Severity Shifts",
                     "",
                     "| Run | Phase | Entering | Surviving Open | Closed | Duplicate | PoC Verified | Upgraded | Downgraded |",
                     "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -464,9 +569,9 @@ class ScorecardGenerator:
         lines.extend(
             [
                 "",
-                "## 4. RQ4: Repetition Consistency, Token Caching & Computational Overhead",
+                "## 4. RQ3 & RQ4: Within-Model Consistency, Token Caching & Computational Overhead",
                 "",
-                "| Tier | Reps | Unique Open (Union) | Consistent Open (All Reps) | Unique TPs (Union) | Consistent TPs (All Reps) | Rep Overlap (Jaccard) | Uncached Input Tokens | Cached Input Tokens | Output Tokens | Total Tokens | Tokens/TP | Wall Clock (s) |",
+                "| Tier | Reps | Unique Open (Union) | Consistent Open (All Reps) | Unique TPs (Union) | Consistent TPs (All Reps) | Within-Model Jaccard | Uncached Input Tokens | Cached Input Tokens | Output Tokens | Total Tokens | Tokens/TP | Wall Clock (s) |",
                 "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
             ]
         )
@@ -484,6 +589,24 @@ class ScorecardGenerator:
                 f"| {tok_tp_str} | {s.mean_wall_clock_seconds:.1f}s |"
             )
 
+        if cross_model:
+            lines.extend(
+                [
+                    "",
+                    "## 5. RQ3 Cross-Model Consistency & Multi-Provider Consensus",
+                    "",
+                    f"- **Evaluated Models ({len(cross_model.models)})**: `{', '.join(cross_model.models)}`",
+                    f"- **Open Root-Cause Consensus**: `{cross_model.consensus_all_models_open}` all-models / "
+                    f"`{cross_model.consensus_majority_models_open}` majority ($\\ge 2$ models) / "
+                    f"`{cross_model.total_unique_open_across_models}` union "
+                    f"(**Mean Pairwise Jaccard**: `{cross_model.mean_cross_model_open_jaccard:.1%}`)",
+                    f"- **Confirmed TP Consensus**: `{cross_model.consensus_all_models_tp}` all-models / "
+                    f"`{cross_model.consensus_majority_models_tp}` majority ($\\ge 2$ models) / "
+                    f"`{cross_model.total_unique_tps_across_models}` union "
+                    f"(**Mean Pairwise TP Jaccard**: `{cross_model.mean_cross_model_tp_jaccard:.1%}`)",
+                ]
+            )
+
         multi_rep_runs = [
             s
             for s in summaries
@@ -493,7 +616,7 @@ class ScorecardGenerator:
             lines.extend(
                 [
                     "",
-                    "## 5. RQ4 Deep Stability: Cumulative Saturation Curve (Unbiased Expected Discover@k)",
+                    "## 6. RQ3 Deep Within-Model Stability: Cumulative Saturation Curve (Unbiased Expected Discover@k)",
                     "",
                     "| Tier | k (Runs) | E[Unique Open(k)] | E[Unique PoC-Verified(k)] | E[Unique TP(k)] | E[Unique FP(k)] |",
                     "| :--- | :---: | :---: | :---: | :---: | :---: |",
@@ -510,35 +633,45 @@ class ScorecardGenerator:
         return "\n".join(lines) + "\n"
 
     def _render_latex_booktabs(
-        self, summaries: list[TierEvaluationSummary], inter_rater: InterRaterStats
+        self,
+        summaries: list[TierEvaluationSummary],
+        inter_rater: InterRaterStats,
+        cross_model: CrossModelConsistencySummary | None = None,
     ) -> str:
+        cm_note = (
+            f", Cross-Model Open Jaccard={cross_model.mean_cross_model_open_jaccard:.3f}"
+            if cross_model
+            else ""
+        )
         lines = [
             "% Auto-generated by Mjolnir ScorecardGenerator for USENIX Security",
-            f"% Blind Review Pool: N={inter_rater.total_canonical_findings}, TP={inter_rater.confirmed_tp_count}, FP={inter_rater.confirmed_fp_count}, Cohen's kappa={inter_rater.cohens_kappa:.3f}",
+            f"% Blind Review Pool: N={inter_rater.total_canonical_findings}, TP={inter_rater.confirmed_tp_count}, FP={inter_rater.confirmed_fp_count}, Cohen's kappa={inter_rater.cohens_kappa:.3f}{cm_note}",
             "\\begin{table*}[t]",
             "\\centering",
             "\\small",
-            "\\begin{tabular}{lcccccccc}",
+            "\\begin{tabular}{lcccccccccc}",
             "\\toprule",
-            "\\textbf{Configuration} & \\textbf{Open} & \\textbf{TP} & \\textbf{FP} & \\textbf{Precision} & \\textbf{Pooled Recall} & \\textbf{False Disproof} & \\textbf{Tokens/TP} & \\textbf{Time (s)} \\\\",
+            "\\textbf{Configuration} & \\textbf{Open} & \\textbf{Unique RCAs} & \\textbf{Redundancy} & \\textbf{TP} & \\textbf{FP} & \\textbf{Precision} & \\textbf{Pooled Recall} & \\textbf{Tokens (M)} & \\textbf{Tokens/TP} & \\textbf{Time (s)} \\\\",
             "\\midrule",
         ]
         for s in summaries:
             safe_name = (
                 s.tier_name.replace("&", "\\&").replace("_", "\\_").replace("@", "\\texttt{@}")
             )
+            tok_m_str = f"{s.mean_tokens_per_run / 1_000_000:.2f}M"
             tok_tp_str = f"{s.tokens_per_tp:,.0f}" if s.tokens_per_tp is not None else "---"
             lines.append(
-                f"{safe_name} & {s.mean_open_findings:.1f} & {s.mean_true_positives:.1f} & "
+                f"{safe_name} & {s.mean_open_findings:.1f} & {s.mean_unique_root_causes:.1f} & "
+                f"{s.redundancy_ratio:.2f}$\\times$ & {s.mean_true_positives:.1f} & "
                 f"{s.mean_false_positives:.1f} & {s.precision_mean * 100:.1f}\\% & "
-                f"{s.pooled_recall_mean * 100:.1f}\\% & {s.false_disproof_rate_mean * 100:.1f}\\% & "
+                f"{s.pooled_recall_mean * 100:.1f}\\% & {tok_m_str} & "
                 f"{tok_tp_str} & {s.mean_wall_clock_seconds:.1f} \\\\"
             )
         lines.extend(
             [
                 "\\bottomrule",
                 "\\end{tabular}",
-                "\\caption{Evaluation across pinned Root-of-Trust targets: true positives, precision, pooled relative recall, and cost efficiency.}",
+                "\\caption{Evaluation across pinned Root-of-Trust targets: quality (TP, precision, pooled recall), redundancy ratio, and token/time cost.}",
                 "\\label{tab:mjolnir-evaluation}",
                 "\\end{table*}",
             ]

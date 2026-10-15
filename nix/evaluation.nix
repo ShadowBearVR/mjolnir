@@ -11,7 +11,7 @@ let
       targetDir = evalCfg.targetDir or null;
       threatModel = evalCfg.threatModel or null;
       evaluatorModel = evalCfg.evaluatorModel or "gemini-3.8-flash";
-      judgeModel = evalCfg.judgeModel or null;
+      judgeModel = evalCfg.judgeModel or "gemini-3.8-flash";
       minPocSeverity = evalCfg.minPocSeverity or "Informational";
       batchSize = evalCfg.batchSize or 64;
       extensions = evalCfg.extensions or [ "rs" "c" "h" ];
@@ -67,6 +67,10 @@ let
       export MJOLNIR_SHELL_HOOK="${shellHookScript}"
       source "${shellHookScript}"
     ''}
+
+    if [ "$#" -eq 0 ]; then
+      set -- run --tiers no_tm,no_expert,full --repetitions 3 --run-label pinned
+    fi
 
     exec ${evaluation-app}/bin/mjolnir-eval --spec "${specFile}" "$@"
   '';

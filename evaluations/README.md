@@ -18,45 +18,38 @@ Each evaluation target is pinned to an immutable Nix-fetched source tree (`pkgs.
 | **OpenTitan RTL**   | `nix run .#eval-opentitan-rtl`   | `c5a58fb8ad7b9e6c19164546a5e492975a77c464` | `hw/top_earlgrey` (Verilator-backed SystemVerilog RTL)                                               |
 | **OpenPRoT**        | `nix run .#eval-openprot`        | `34d82b1f2360bcc43986f5a9846e5b85de94ba98` | `services`                                                                                           |
 
-## Reproducible Suite Entrypoints
+## Reproducible Suite Entrypoints (Zero Options Required)
 
 ```bash
-# Run Mjolnir multi-checkpoint ablations (no_tm, no_expert, full x 3 reps on fixed gemini-3.8-flash) across all 6 targets
+# 1. Run Mjolnir multi-checkpoint ablations (no_tm, no_expert, full x 3 reps on gemini-3.8-flash) across all 6 targets
 nix run .#eval-ablation
 
-# Run Antigravity CLI agent baselines (4 modes x 3 reps on fixed model) across all 6 targets
+# 2. Run Antigravity CLI agent baselines (4 modes x 3 reps) across all 6 targets
 nix run .#eval-cli
 
-# Run single-project multi-model / multi-provider variance comparison (full x 3 reps on flagship target caliptra-sw by default)
-# Default models: gemini-4-argon,vertex_ai/claude-sonnet-4-6 (merged with gemini-3.8-flash from eval-ablation)
+# 3. Run cross-language multi-model consistency suite (full x 3 models x 3 reps across Rust/C/RTL: caliptra-sw, opentitan-fw, opentitan-rtl)
+# Default models: gemini-3.8-flash,gemini-4-argon,vertex_ai/claude-sonnet-4-6
 nix run .#eval-models
-# Or override target / models:
-MJOLNIR_EVAL_MODEL_TARGET="caliptra-sw" MJOLNIR_EVAL_MODELS="gemini-4-argon,vertex_ai/claude-sonnet-4-6" nix run .#eval-models
 
-# Run deep stability & convergence suite (default: 20 reps of full on caliptra-sw with gemini-3.8-flash)
+# 4. Run deep within-model stability & convergence suite (20 reps of full on caliptra-sw with gemini-3.8-flash)
 nix run .#eval-stability
-# Or override reps / target / model:
-MJOLNIR_EVAL_STABILITY_REPS=20 MJOLNIR_EVAL_STABILITY_TARGET="caliptra-sw" nix run .#eval-stability
 
-# Run fast real-life smoke validation on a single file (--scope smoke)
-nix run .#eval-caliptra-dpe -- run --scope smoke --tiers no_tm,full --repetitions 1 --run-label smoke-validation
+# 5. Run a single project's default ablation suite (no_tm, no_expert, full x 3 reps)
+nix run .#eval-caliptra-sw
 ```
 
 ## 3-Step Workflow (`run` $\to$ `pool` $\to$ `scorecard`)
 
 ```bash
-# 1. Run Mjolnir ablation tiers (extracts all 5 phase checkpoints automatically) + Antigravity CLI/SAST baselines
-nix run .#eval-caliptra-sw -- run \
-  --run-label usenix_v1 \
-  --tiers base,no_tm,no_expert,full,cli_antigravity,cli_antigravity_no_tm,cli_antigravity_per_file,cli_antigravity_per_file_no_tm,sast \
-  --repetitions 3
+# 1. Run evaluation suites (writes trials_manifest.json, blind_review_pool.json, and scorecard.md)
+nix run .#eval-caliptra-sw
 
 # 2. (Optional) Re-cluster trials into blind_review_pool.json / blind_review_pool.md while preserving human labels
 nix run .#eval-caliptra-sw -- pool \
-  --eval-dir ./test-out/evaluations/caliptra-sw/usenix_v1
+  --eval-dir ./test-out/evaluations/caliptra-sw/pinned
 
 # 3. After labeling reviewer_1_label / reviewer_2_label / adjudicated_label in blind_review_pool.json,
 #    regenerate RQ1-RQ4 Markdown & USENIX Security LaTeX booktabs scorecards (including Cohen's kappa)
 nix run .#eval-caliptra-sw -- scorecard \
-  --eval-dir ./test-out/evaluations/caliptra-sw/usenix_v1
+  --eval-dir ./test-out/evaluations/caliptra-sw/pinned
 ```

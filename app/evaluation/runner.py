@@ -11,11 +11,12 @@ import shutil
 import tempfile
 import time
 
-from evaluation.constants import ABLATION_TIERS, DEFAULT_CLI_TEMPLATES
+from evaluation.constants import ABLATION_TIERS, DEFAULT_CLI_TEMPLATES, ORDERED_PIPELINE_PHASES
 from evaluation.grader import (
     FindingPooler,
     compute_phase_transitions,
     extract_phase_checkpoint_findings,
+    normalize_phase_id,
 )
 from evaluation.models import TrialRunRecord
 from evaluation.sandbox.bwrap_runner import IsolatedProcessRunner
@@ -106,32 +107,205 @@ def extract_findings_from_cli_output(
     return normalized
 
 
-def parse_usage_metrics(usage_summary: dict | None) -> tuple[int, int, int, int]:
-    """Extracts (total_tokens, cached_tokens, uncached_input_tokens, output_tokens)."""
-    if not usage_summary or not isinstance(usage_summary, dict):
-        return 0, 0, 0, 0
-
-    bucket = usage_summary.get("total") or usage_summary.get("totals") or usage_summary
-    if not isinstance(bucket, dict):
-        return 0, 0, 0, 0
-
+def _parse_single_usage_bucket(bucket: dict) -> tuple[int, int, int, int]:
+    """Extracts (total_tokens, cached_tokens, uncached_input_tokens, output_tokens) from a single usage bucket."""
     total_tokens = int(bucket.get("total_tokens", 0) or 0)
-    cached_tokens = int(bucket.get("cache_tokens", bucket.get("cached_tokens", 0)) or 0)
+    cached_tokens = int(
+        bucket.get(
+            "cache_tokens",
+            bucket.get("cached_tokens", bucket.get("cache_read_input_tokens", 0)),
+        )
+        or 0
+    )
+    prompt_tokens = int(
+        bucket.get("prompt_tokens", bucket.get("input_tokens", bucket.get("total_input_tokens", 0)))
+        or 0
+    )
     uncached_input = int(
         bucket.get(
             "uncached_tokens",
             bucket.get(
                 "uncached_input_tokens",
-                max(0, int(bucket.get("prompt_tokens", 0) or 0) - cached_tokens),
+                max(0, prompt_tokens - cached_tokens),
             ),
         )
         or 0
     )
-    output_tokens = int(bucket.get("total_output_tokens", bucket.get("output_tokens", 0)) or 0)
+    output_tokens = int(
+        bucket.get(
+            "total_output_tokens",
+            bucket.get("output_tokens", bucket.get("completion_tokens", 0)),
+        )
+        or 0
+    )
     if total_tokens == 0 and (cached_tokens or uncached_input or output_tokens):
         total_tokens = cached_tokens + uncached_input + output_tokens
-
     return total_tokens, cached_tokens, uncached_input, output_tokens
+
+
+def parse_usage_metrics(
+    usage_summary: dict | None,
+    checkpoint_phase: str | None = None,
+) -> tuple[int, int, int, int]:
+    """Extracts (total_tokens, cached_tokens, uncached_input_tokens, output_tokens).
+
+    When `checkpoint_phase` is provided and `by_phase` (or `by_agent`) is present in `usage_summary`,
+    computes cumulative token usage up to and including `checkpoint_phase`.
+    """
+    if not usage_summary or not isinstance(usage_summary, dict):
+        return 0, 0, 0, 0
+
+    norm_cp = normalize_phase_id(checkpoint_phase) if checkpoint_phase else ""
+    if norm_cp and norm_cp in ORDERED_PIPELINE_PHASES and norm_cp != "final_review":
+        cp_idx = ORDERED_PIPELINE_PHASES.index(norm_cp)
+        allowed_phases = {"project_exploration", *ORDERED_PIPELINE_PHASES[: cp_idx + 1]}
+        by_phase = usage_summary.get("by_phase")
+        if isinstance(by_phase, dict) and by_phase:
+            tot_t = cac_t = unc_t = out_t = 0
+            for pid, p_bucket in by_phase.items():
+                if normalize_phase_id(pid) in allowed_phases or pid == "project_exploration":
+                    if isinstance(p_bucket, dict):
+                        t, c, u, o = _parse_single_usage_bucket(p_bucket)
+                        tot_t += t
+                        cac_t += c
+                        unc_t += u
+                        out_t += o
+            return tot_t, cac_t, unc_t, out_t
+
+        by_agent = usage_summary.get("by_agent")
+        if isinstance(by_agent, dict) and by_agent:
+            agent_phase_map = {
+                "ProjectExpertAgent": "project_exploration",
+                "AuditorAgent": "discovery",
+                "DeduplicationAgent": "deduplication",
+                "AdversarialReviewerAgent": "initial_review",
+                "ExploitCreationAgent": "poc_creation",
+            }
+            tot_t = cac_t = unc_t = out_t = 0
+            for a_name, a_bucket in by_agent.items():
+                mapped_phase = agent_phase_map.get(a_name, "discovery")
+                if mapped_phase in allowed_phases and isinstance(a_bucket, dict):
+                    t, c, u, o = _parse_single_usage_bucket(a_bucket)
+                    tot_t += t
+                    cac_t += c
+                    unc_t += u
+                    out_t += o
+            return tot_t, cac_t, unc_t, out_t
+
+    bucket = usage_summary.get("total") or usage_summary.get("totals") or usage_summary
+    if not isinstance(bucket, dict):
+        return 0, 0, 0, 0
+    return _parse_single_usage_bucket(bucket)
+
+
+def extract_or_estimate_cli_usage(
+    stdout_text: str,
+    stderr_text: str,
+    out_json_path: Path | None,
+    prompt_text: str,
+    scanned_files_bytes: int = 0,
+) -> dict:
+    """Extracts token telemetry from CLI output/JSON if emitted, or computes a deterministic char/4 token estimate."""
+    # 1. Check out_json_path for embedded usage metadata
+    if out_json_path and out_json_path.exists():
+        try:
+            parsed = json.loads(out_json_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                for key in ("usage", "token_usage", "usage_metadata", "total"):
+                    sub = parsed.get(key)
+                    if isinstance(sub, dict):
+                        tot, cac, unc, out = _parse_single_usage_bucket(sub)
+                        if tot > 0:
+                            return {
+                                "total": {
+                                    "prompt_tokens": cac + unc,
+                                    "cache_tokens": cac,
+                                    "uncached_tokens": unc,
+                                    "output_tokens": out,
+                                    "total_input_tokens": cac + unc,
+                                    "total_output_tokens": out,
+                                    "total_tokens": tot,
+                                },
+                                "source": "cli_json_telemetry",
+                            }
+        except Exception:
+            pass
+
+    # 2. Check stdout / stderr for JSON usage lines or regex token counters
+    combined = f"{stdout_text or ''}\n{stderr_text or ''}"
+    for line in combined.splitlines():
+        s = line.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    cand = obj.get("usage") if isinstance(obj.get("usage"), dict) else obj
+                    tot, cac, unc, out = _parse_single_usage_bucket(cand)
+                    if tot > 0:
+                        return {
+                            "total": {
+                                "prompt_tokens": cac + unc,
+                                "cache_tokens": cac,
+                                "uncached_tokens": unc,
+                                "output_tokens": out,
+                                "total_input_tokens": cac + unc,
+                                "total_output_tokens": out,
+                                "total_tokens": tot,
+                            },
+                            "source": "cli_stream_telemetry",
+                        }
+            except Exception:
+                pass
+
+    m_in = re.search(
+        r"(?:input_tokens|prompt_tokens|input tokens)\s*[:=]\s*([0-9,]+)", combined, re.IGNORECASE
+    )
+    m_out = re.search(
+        r"(?:output_tokens|completion_tokens|output tokens)\s*[:=]\s*([0-9,]+)",
+        combined,
+        re.IGNORECASE,
+    )
+    m_cac = re.search(
+        r"(?:cache_tokens|cached_tokens|cache_read_input_tokens)\s*[:=]\s*([0-9,]+)",
+        combined,
+        re.IGNORECASE,
+    )
+    if m_in or m_out:
+        in_tok = int(m_in.group(1).replace(",", "")) if m_in else 0
+        out_tok = int(m_out.group(1).replace(",", "")) if m_out else 0
+        cac_tok = int(m_cac.group(1).replace(",", "")) if m_cac else 0
+        unc_tok = max(0, in_tok - cac_tok)
+        return {
+            "total": {
+                "prompt_tokens": in_tok,
+                "cache_tokens": cac_tok,
+                "uncached_tokens": unc_tok,
+                "output_tokens": out_tok,
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+                "total_tokens": in_tok + out_tok,
+            },
+            "source": "cli_regex_telemetry",
+        }
+
+    # 3. Deterministic fallback estimate (~4 bytes/token across prompt + scanned in-scope files + output)
+    out_file_bytes = (
+        out_json_path.stat().st_size if (out_json_path and out_json_path.exists()) else 0
+    )
+    est_in = max(1, (len(prompt_text.encode("utf-8")) + max(0, scanned_files_bytes)) // 4)
+    est_out = max(1, (len((stdout_text or "").encode("utf-8")) + out_file_bytes) // 4)
+    return {
+        "total": {
+            "prompt_tokens": est_in,
+            "cache_tokens": 0,
+            "uncached_tokens": est_in,
+            "output_tokens": est_out,
+            "total_input_tokens": est_in,
+            "total_output_tokens": est_out,
+            "total_tokens": est_in + est_out,
+        },
+        "source": "estimated_char_4",
+    }
 
 
 def format_model_slug(model: str) -> str:
@@ -447,6 +621,7 @@ class EvaluationRunner:
                         vulnerabilities_data=cp_vulns,
                         usage_summary=usage_summary,
                         wall_clock_seconds=elapsed,
+                        checkpoint_phase=str(cp_phase),
                     )
                     records.append(cp_record)
 
@@ -464,8 +639,11 @@ class EvaluationRunner:
         usage_summary: dict | None,
         wall_clock_seconds: float,
         model: str = "",
+        checkpoint_phase: str | None = None,
     ) -> TrialRunRecord:
-        tot_tok, cached_tok, uncached_in, out_tok = parse_usage_metrics(usage_summary)
+        tot_tok, cached_tok, uncached_in, out_tok = parse_usage_metrics(
+            usage_summary, checkpoint_phase=checkpoint_phase
+        )
         open_findings = [
             v for v in vulnerabilities_data if str(v.get("status", "Open")).lower() == "open"
         ]
@@ -616,16 +794,18 @@ class EvaluationRunner:
 
         target_dirs = self.resolve_target_dirs()
         granularity = str(tier_cfg.get("granularity", "dir"))
+        files_to_scan = discover_source_files(
+            code_dir=str(snapshot_dir),
+            src_dirs=target_dirs,
+            extensions=set(self.project.get("extensions", ["rs", "c", "h"])),
+            exclude_dirs=self.project.get("excludeDirs", []),
+            exclude_patterns=self.project.get("excludePatterns", []),
+        )
 
         if granularity == "per_file":
-            files_to_scan = discover_source_files(
-                code_dir=str(snapshot_dir),
-                src_dirs=target_dirs,
-                extensions=set(self.project.get("extensions", ["rs", "c", "h"])),
-                exclude_dirs=self.project.get("excludeDirs", []),
-                exclude_patterns=self.project.get("excludePatterns", []),
-            )
             aggregated: list[dict] = []
+            tot_in = tot_cac = tot_unc = tot_out = 0
+            usage_source = "estimated_char_4"
             for idx, rel_file in enumerate(files_to_scan):
                 out_json = trial_out_dir / f"{cli_key}_file_{idx}.json"
                 prompt = (
@@ -646,10 +826,41 @@ class EvaluationRunner:
                 res = isolated_runner.run_isolated(
                     cmd=argv, cwd=snapshot_dir, env=os.environ.copy()
                 )
+                f_path = snapshot_dir / rel_file
+                f_bytes = f_path.stat().st_size if f_path.exists() else 0
+                file_usage = extract_or_estimate_cli_usage(
+                    stdout_text=res.stdout,
+                    stderr_text=res.stderr,
+                    out_json_path=out_json,
+                    prompt_text=prompt,
+                    scanned_files_bytes=f_bytes,
+                )
+                _, cac, unc, out = parse_usage_metrics(file_usage)
+                tot_cac += cac
+                tot_unc += unc
+                tot_in += cac + unc
+                tot_out += out
+                if file_usage.get("source") != "estimated_char_4":
+                    usage_source = str(file_usage.get("source"))
                 aggregated.extend(
                     extract_findings_from_cli_output(out_json, res.stdout, default_file=rel_file)
                 )
-            return aggregated, None
+            usage_summary = {
+                "total": {
+                    "prompt_tokens": tot_in,
+                    "cache_tokens": tot_cac,
+                    "uncached_tokens": tot_unc,
+                    "output_tokens": tot_out,
+                    "total_input_tokens": tot_in,
+                    "total_output_tokens": tot_out,
+                    "total_tokens": tot_in + tot_out,
+                },
+                "source": usage_source,
+            }
+            (trial_out_dir / "token_usage.json").write_text(
+                json.dumps(usage_summary, indent=2), encoding="utf-8"
+            )
+            return aggregated, usage_summary
 
         out_json = trial_out_dir / f"{cli_key}_findings.json"
         target_str = ", ".join(target_dirs)
@@ -669,7 +880,22 @@ class EvaluationRunner:
             },
         )
         res = isolated_runner.run_isolated(cmd=argv, cwd=snapshot_dir, env=os.environ.copy())
-        return extract_findings_from_cli_output(out_json, res.stdout), None
+        total_scanned_bytes = sum(
+            (snapshot_dir / rf).stat().st_size
+            for rf in files_to_scan
+            if (snapshot_dir / rf).exists()
+        )
+        usage_summary = extract_or_estimate_cli_usage(
+            stdout_text=res.stdout,
+            stderr_text=res.stderr,
+            out_json_path=out_json,
+            prompt_text=prompt,
+            scanned_files_bytes=total_scanned_bytes,
+        )
+        (trial_out_dir / "token_usage.json").write_text(
+            json.dumps(usage_summary, indent=2), encoding="utf-8"
+        )
+        return extract_findings_from_cli_output(out_json, res.stdout), usage_summary
 
     def _run_openant_tier(
         self,

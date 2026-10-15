@@ -223,21 +223,9 @@
             jobs = evalTargets;
           };
 
-          eval-sast = pkgs.writeShellScriptBin "eval-sast" ''
-            set -euo pipefail
-            echo "[BEGIN] Reproducible SAST Baseline Suite (Semgrep + Clippy across all 6 targets)"
-            ${pkgs.lib.concatMapStringsSep "\n" (r: ''
-              echo ""
-              echo ">>> Running SAST baseline target: ${r.name}"
-              ${r}/bin/${r.name} run --tiers sast --repetitions 1 --run-label sast --judge-model heuristic "$@"
-            '') evalTargets}
-            echo ""
-            echo "[END] Reproducible SAST Baseline Suite"
-          '';
-
           eval-ablation = pkgs.writeShellScriptBin "eval-ablation" ''
             set -euo pipefail
-            echo "[BEGIN] Reproducible Mjolnir Multi-Checkpoint Ablation Suite (no_tm, no_expert, full across all 6 targets)"
+            echo "[BEGIN] Reproducible Mjolnir Multi-Checkpoint Ablation Suite (no_tm, no_expert, full x 3 reps across all 6 targets)"
             ${pkgs.lib.concatMapStringsSep "\n" (r: ''
               echo ""
               echo ">>> Running Mjolnir ablation target: ${r.name}"
@@ -249,7 +237,7 @@
 
           eval-cli = pkgs.writeShellScriptBin "eval-cli" ''
             set -euo pipefail
-            echo "[BEGIN] Reproducible CLI Agent Baseline Suite (Antigravity CLI across all 6 targets)"
+            echo "[BEGIN] Reproducible CLI Agent Baseline Suite (Antigravity CLI 4 modes x 3 reps across all 6 targets)"
             ${pkgs.lib.concatMapStringsSep "\n" (r: ''
               echo ""
               echo ">>> Running CLI baseline target: ${r.name}"
@@ -261,35 +249,40 @@
 
           eval-models = pkgs.writeShellScriptBin "eval-models" ''
             set -euo pipefail
-            MODELS="''${MJOLNIR_EVAL_MODELS:-gemini-4-argon,vertex_ai/claude-sonnet-4-6}"
-            TARGET="''${MJOLNIR_EVAL_MODEL_TARGET:-caliptra-sw}"
-            echo "[BEGIN] Reproducible Single-Project Multi-Model / Multi-Provider Variance Suite (Target=$TARGET, Models=$MODELS x 3 reps)"
-            case "$TARGET" in
-              caliptra-sw)
-                ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              caliptra-dpe)
-                ${eval-caliptra-dpe}/bin/${eval-caliptra-dpe.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              opentitan-fw)
-                ${eval-opentitan-fw}/bin/${eval-opentitan-fw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              openprot)
-                ${eval-openprot}/bin/${eval-openprot.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              opentitan-rtl)
-                ${eval-opentitan-rtl}/bin/${eval-opentitan-rtl.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              caliptra-mcu-sw)
-                ${eval-caliptra-mcu-sw}/bin/${eval-caliptra-mcu-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
-                ;;
-              *)
-                echo "Unknown MJOLNIR_EVAL_MODEL_TARGET: $TARGET" >&2
-                exit 1
-                ;;
-            esac
+            MODELS="''${MJOLNIR_EVAL_MODELS:-gemini-3.8-flash,gemini-4-argon,vertex_ai/claude-sonnet-4-6}"
+            TARGETS="''${MJOLNIR_EVAL_MODEL_TARGETS:-''${MJOLNIR_EVAL_MODEL_TARGET:-caliptra-sw,opentitan-fw,opentitan-rtl}}"
+            echo "[BEGIN] Reproducible Cross-Language Multi-Model / Multi-Provider Consistency Suite (Targets=$TARGETS, Models=$MODELS x 3 reps)"
+            IFS=',' read -r -a TARGET_ARR <<< "$TARGETS"
+            for TARGET in "''${TARGET_ARR[@]}"; do
+              echo ""
+              echo ">>> Running Multi-Model consistency target: $TARGET"
+              case "$TARGET" in
+                caliptra-sw)
+                  ${eval-caliptra-sw}/bin/${eval-caliptra-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                caliptra-dpe)
+                  ${eval-caliptra-dpe}/bin/${eval-caliptra-dpe.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                opentitan-fw)
+                  ${eval-opentitan-fw}/bin/${eval-opentitan-fw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                openprot)
+                  ${eval-openprot}/bin/${eval-openprot.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                opentitan-rtl)
+                  ${eval-opentitan-rtl}/bin/${eval-opentitan-rtl.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                caliptra-mcu-sw)
+                  ${eval-caliptra-mcu-sw}/bin/${eval-caliptra-mcu-sw.name} run --tiers full --evaluator-model "$MODELS" --repetitions 3 --run-label pinned "$@"
+                  ;;
+                *)
+                  echo "Unknown MJOLNIR_EVAL_MODEL_TARGET: $TARGET" >&2
+                  exit 1
+                  ;;
+              esac
+            done
             echo ""
-            echo "[END] Reproducible Single-Project Multi-Model / Multi-Provider Variance Suite"
+            echo "[END] Reproducible Cross-Language Multi-Model / Multi-Provider Consistency Suite"
           '';
 
           eval-stability = pkgs.writeShellScriptBin "eval-stability" ''
@@ -383,7 +376,6 @@
               eval-opentitan-rtl
               eval-openprot
               eval-all
-              eval-sast
               eval-ablation
               eval-cli
               eval-models

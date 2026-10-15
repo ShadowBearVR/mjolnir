@@ -154,6 +154,22 @@ class InterRaterStats(BaseModel):
     cohens_kappa: float = 0.0
 
 
+class CrossModelConsistencySummary(BaseModel):
+    """Cross-model / cross-provider root-cause overlap and consensus metrics (RQ3)."""
+
+    models: list[str] = Field(default_factory=list)
+    total_unique_open_across_models: int = 0
+    consensus_all_models_open: int = 0
+    consensus_majority_models_open: int = 0
+    total_unique_tps_across_models: int = 0
+    consensus_all_models_tp: int = 0
+    consensus_majority_models_tp: int = 0
+    pairwise_open_jaccard: dict[str, float] = Field(default_factory=dict)
+    pairwise_tp_jaccard: dict[str, float] = Field(default_factory=dict)
+    mean_cross_model_open_jaccard: float = 0.0
+    mean_cross_model_tp_jaccard: float = 0.0
+
+
 class TierEvaluationSummary(BaseModel):
     """Aggregated statistical metrics for an evaluation tier or phase checkpoint across repetitions (RQ1-RQ4)."""
 
@@ -164,6 +180,9 @@ class TierEvaluationSummary(BaseModel):
     total_pooled_tps: int = 0
     mean_open_findings: float = 0.0
     std_open_findings: float = 0.0
+    mean_unique_root_causes: float = 0.0
+    mean_redundant_duplicates: float = 0.0
+    redundancy_ratio: float = 1.0
     mean_true_positives: float = 0.0
     std_true_positives: float = 0.0
     unique_open_across_reps: int = 0

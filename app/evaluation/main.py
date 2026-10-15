@@ -25,14 +25,14 @@ def _add_run_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--tiers",
-        default="base,full",
+        default="no_tm,no_expert,full",
         help=f"Comma-separated evaluation tiers ({', '.join(ABLATION_TIERS.keys())})",
     )
     p.add_argument(
         "--repetitions",
         type=int,
-        default=1,
-        help="Number of statistical repetitions per tier (e.g. 3)",
+        default=3,
+        help="Number of statistical repetitions per tier (default: 3)",
     )
     p.add_argument(
         "--evaluator-model",

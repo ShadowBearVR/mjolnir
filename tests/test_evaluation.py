@@ -22,6 +22,7 @@ from evaluation.models import CanonicalFinding, TrialRunRecord
 from evaluation.runner import (
     expand_cli_template,
     extract_findings_from_cli_output,
+    extract_or_estimate_cli_usage,
     format_model_slug,
     parse_usage_metrics,
 )
@@ -111,13 +112,14 @@ class TestEvaluationHarness(unittest.TestCase):
             },
             {
                 "id": "v-duplicate",
-                "file": "sw/device/silicon_creator/rom_ext/rom_ext.c",
-                "location": "rom_ext_verify (Line 130)",
+                "file": "sw/device/silicon_creator/rom_ext/sigverify_helper.c",
+                "location": "sigverify_helper (Line 310)",
                 "cwe": "CWE-252",
                 "severity": "High",
                 "status": "Duplicate",
-                "title": "Duplicate sigverify finding",
-                "description": "Duplicate of v-true-bug.",
+                "duplicate_of": "v-true-bug",
+                "title": "Duplicate sigverify finding in helper",
+                "description": "Duplicate of v-true-bug across file boundary.",
                 "history": [
                     {
                         "phase_id": "discovery",
@@ -128,6 +130,7 @@ class TestEvaluationHarness(unittest.TestCase):
                     {
                         "phase_id": "deduplication",
                         "status": "Duplicate",
+                        "duplicate_of": "v-true-bug",
                         "severity": "High",
                         "is_duplicate": True,
                     },
@@ -311,11 +314,19 @@ class TestEvaluationHarness(unittest.TestCase):
             summaries = ScorecardGenerator().generate_scorecard(out_dir)
             by_tier = {s.ablation_tier: s for s in summaries}
 
-            # Full Mjolnir kept the 1 TP and eliminated the 1 FP from discovery -> 100% precision, 100% recall, 100% FP elimination
+            # Full Mjolnir kept the 1 TP and eliminated the 1 FP and 1 Duplicate from discovery
             self.assertEqual(by_tier["full"].precision_mean, 1.0)
             self.assertEqual(by_tier["full"].pooled_recall_mean, 1.0)
             self.assertEqual(by_tier["full"].fp_elimination_rate_mean, 1.0)
             self.assertEqual(by_tier["full"].false_disproof_rate_mean, 0.0)
+            self.assertEqual(by_tier["full"].mean_unique_root_causes, 1.0)
+            self.assertEqual(by_tier["full"].mean_redundant_duplicates, 0.0)
+            self.assertEqual(by_tier["full"].redundancy_ratio, 1.0)
+            # At discovery, 3 open findings mapped to 2 unique root causes (1 redundant duplicate) -> 1.5x redundancy
+            self.assertEqual(by_tier["full@discovery"].mean_open_findings, 3.0)
+            self.assertEqual(by_tier["full@discovery"].mean_unique_root_causes, 2.0)
+            self.assertEqual(by_tier["full@discovery"].mean_redundant_duplicates, 1.0)
+            self.assertEqual(by_tier["full@discovery"].redundancy_ratio, 1.5)
             self.assertEqual(by_tier["full"].unique_open_across_reps, 1)
             self.assertEqual(by_tier["full"].consistent_open_all_reps, 1)
             self.assertEqual(by_tier["full"].unique_tps_across_reps, 1)
@@ -338,21 +349,99 @@ class TestEvaluationHarness(unittest.TestCase):
             ["antigravity", "-p", "Audit file 'foo.c' & bar.c", "--dangerously-skip-permissions"],
         )
 
-        tot, cached, uncached, out = parse_usage_metrics(
-            {
-                "total": {
-                    "prompt_tokens": 110000,
-                    "cache_tokens": 90000,
-                    "uncached_tokens": 20000,
-                    "total_output_tokens": 10000,
-                    "total_tokens": 120000,
-                }
-            }
-        )
+        usage_with_phases = {
+            "total": {
+                "prompt_tokens": 110000,
+                "cache_tokens": 90000,
+                "uncached_tokens": 20000,
+                "total_output_tokens": 10000,
+                "total_tokens": 120000,
+            },
+            "by_phase": {
+                "project_exploration": {
+                    "prompt_tokens": 20000,
+                    "cache_tokens": 10000,
+                    "uncached_tokens": 10000,
+                    "total_output_tokens": 2000,
+                    "total_tokens": 22000,
+                },
+                "discovery": {
+                    "prompt_tokens": 30000,
+                    "cache_tokens": 25000,
+                    "uncached_tokens": 5000,
+                    "total_output_tokens": 3000,
+                    "total_tokens": 33000,
+                },
+                "deduplication": {
+                    "prompt_tokens": 10000,
+                    "cache_tokens": 8000,
+                    "uncached_tokens": 2000,
+                    "total_output_tokens": 1000,
+                    "total_tokens": 11000,
+                },
+                "initial_review": {
+                    "prompt_tokens": 20000,
+                    "cache_tokens": 18000,
+                    "uncached_tokens": 2000,
+                    "total_output_tokens": 2000,
+                    "total_tokens": 22000,
+                },
+                "poc_creation": {
+                    "prompt_tokens": 20000,
+                    "cache_tokens": 19000,
+                    "uncached_tokens": 1000,
+                    "total_output_tokens": 1000,
+                    "total_tokens": 21000,
+                },
+                "final_review": {
+                    "prompt_tokens": 10000,
+                    "cache_tokens": 10000,
+                    "uncached_tokens": 0,
+                    "total_output_tokens": 1000,
+                    "total_tokens": 11000,
+                },
+            },
+        }
+        tot, cached, uncached, out = parse_usage_metrics(usage_with_phases)
         self.assertEqual(tot, 120000)
         self.assertEqual(cached, 90000)
         self.assertEqual(uncached, 20000)
         self.assertEqual(out, 10000)
+
+        # Checkpoint at discovery should equal project_exploration + discovery = 55000
+        tot_d, cac_d, unc_d, out_d = parse_usage_metrics(
+            usage_with_phases, checkpoint_phase="discovery"
+        )
+        self.assertEqual(tot_d, 55000)
+        self.assertEqual(cac_d, 35000)
+        self.assertEqual(unc_d, 15000)
+        self.assertEqual(out_d, 5000)
+
+        # Checkpoint at initial_review (Fast pipeline) should equal exploration + discovery + dedup + initial_review = 88000
+        tot_ir, _, _, _ = parse_usage_metrics(usage_with_phases, checkpoint_phase="initial_review")
+        self.assertEqual(tot_ir, 88000)
+
+        # CLI token extraction from regex / fallback
+        cli_telemetry = extract_or_estimate_cli_usage(
+            stdout_text="Scan complete.\ninput_tokens: 15,000\noutput_tokens: 2,500\ncached_tokens: 5,000\n",
+            stderr_text="",
+            out_json_path=None,
+            prompt_text="Audit repo",
+        )
+        self.assertEqual(cli_telemetry["source"], "cli_regex_telemetry")
+        self.assertEqual(cli_telemetry["total"]["total_tokens"], 17500)
+        self.assertEqual(cli_telemetry["total"]["cache_tokens"], 5000)
+        self.assertEqual(cli_telemetry["total"]["uncached_tokens"], 10000)
+
+        cli_fallback = extract_or_estimate_cli_usage(
+            stdout_text="[]" * 20,
+            stderr_text="",
+            out_json_path=None,
+            prompt_text="A" * 400,
+            scanned_files_bytes=1200,
+        )
+        self.assertEqual(cli_fallback["source"], "estimated_char_4")
+        self.assertEqual(cli_fallback["total"]["prompt_tokens"], 400)
 
         with tempfile.TemporaryDirectory() as tmp:
             missing_json = Path(tmp) / "out.json"
@@ -456,6 +545,126 @@ class TestEvaluationHarness(unittest.TestCase):
             self.assertEqual(
                 format_model_slug("vertex_ai/claude-sonnet-4-6@20260514"), "claude-sonnet-4-6"
             )
+
+    def test_cross_model_consistency_and_litellm_token_tracking(self) -> None:
+        from types import SimpleNamespace
+        from providers.adk.utilities.usage_tracker import UsageTracker
+
+        tracker = UsageTracker()
+        # 1. Gemini event where candidates_token_count (200) and thoughts_token_count (300) sum to 500 output
+        gemini_ev = SimpleNamespace(
+            author="AuditorAgent",
+            branch="AuditorAgent@file1.rs",
+            node_name="discovery_phase",
+            model_version="gemini-3.8-flash",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=1000,
+                candidates_token_count=200,
+                cached_content_token_count=600,
+                thoughts_token_count=300,
+                total_token_count=1500,
+            ),
+        )
+        tracker.track_event(gemini_ev)
+        self.assertEqual(tracker.total_usage["total_tokens"], 1500)
+        self.assertEqual(tracker.total_usage["total_output_tokens"], 500)
+        self.assertEqual(tracker.usage_by_phase["discovery"]["total_tokens"], 1500)
+
+        # 2. LiteLLM (Claude/OpenAI) event where candidates_token_count (500) already includes reasoning_tokens (300)
+        litellm_ev = SimpleNamespace(
+            author="AdversarialReviewerAgent",
+            branch="AdversarialReviewerAgent@initial_review_v1",
+            node_name="initial_review_phase",
+            model_version="vertex_ai/claude-sonnet-4-6",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=1000,
+                candidates_token_count=500,
+                cached_content_token_count=400,
+                thoughts_token_count=300,
+                total_token_count=1500,
+            ),
+        )
+        tracker.track_event(litellm_ev)
+        # Total should be 1500 + 1500 = 3000 (not 3300!)
+        self.assertEqual(tracker.total_usage["total_tokens"], 3000)
+        self.assertEqual(tracker.usage_by_phase["initial_review"]["total_tokens"], 1500)
+
+        # 3. Cross-model consistency across 3 models on same target
+        f_shared = {
+            "id": "v1",
+            "file": "runtime/src/verify.rs",
+            "location": "Line 42",
+            "cwe": "CWE-252",
+            "severity": "Critical",
+            "status": "Open",
+            "title": "Unchecked verify status",
+            "description": "Signature status unchecked.",
+            "history": [],
+        }
+        f_extra = {
+            "id": "v2",
+            "file": "runtime/src/stash.rs",
+            "location": "Line 88",
+            "cwe": "CWE-787",
+            "severity": "High",
+            "status": "Open",
+            "title": "Out of bounds write in stash",
+            "description": "Index unchecked.",
+            "history": [],
+        }
+        trials = [
+            TrialRunRecord(
+                project_name="Caliptra",
+                repo_name="caliptra-sw",
+                pinned_rev="262470b",
+                target_dir="runtime/src",
+                ablation_tier="full[gemini-3.8-flash]",
+                tier_name="Mjolnir Full (gemini-3.8-flash)",
+                model="gemini-3.8-flash",
+                repetition=1,
+                open_findings_count=1,
+                total_reported_findings=1,
+                findings=[f_shared],
+            ),
+            TrialRunRecord(
+                project_name="Caliptra",
+                repo_name="caliptra-sw",
+                pinned_rev="262470b",
+                target_dir="runtime/src",
+                ablation_tier="full[gemini-4-argon]",
+                tier_name="Mjolnir Full (gemini-4-argon)",
+                model="gemini-4-argon",
+                repetition=1,
+                open_findings_count=2,
+                total_reported_findings=2,
+                findings=[f_shared, f_extra],
+            ),
+            TrialRunRecord(
+                project_name="Caliptra",
+                repo_name="caliptra-sw",
+                pinned_rev="262470b",
+                target_dir="runtime/src",
+                ablation_tier="full[claude-sonnet-4-6]",
+                tier_name="Mjolnir Full (claude-sonnet-4-6)",
+                model="vertex_ai/claude-sonnet-4-6",
+                repetition=1,
+                open_findings_count=2,
+                total_reported_findings=2,
+                findings=[f_shared, f_extra],
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            (out_dir / "trials_manifest.json").write_text(
+                json.dumps([t.model_dump() for t in trials], indent=2), encoding="utf-8"
+            )
+            ScorecardGenerator().generate_scorecard(out_dir)
+            sc_json = json.loads((out_dir / "scorecard.json").read_text(encoding="utf-8"))
+            cm = sc_json["cross_model_consistency"]
+            self.assertIsNotNone(cm)
+            self.assertEqual(cm["total_unique_open_across_models"], 2)
+            self.assertEqual(cm["consensus_all_models_open"], 1)
+            self.assertEqual(cm["consensus_majority_models_open"], 2)
 
 
 if __name__ == "__main__":

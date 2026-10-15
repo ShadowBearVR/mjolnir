@@ -120,6 +120,8 @@ def extract_phase_checkpoint_findings(
         if "poc_creation" not in allowed_phases:
             reconstructed["poc_verified"] = False
             reconstructed["poc_code"] = None
+        if "deduplication" not in allowed_phases:
+            reconstructed["duplicate_of"] = None
 
         for key in (
             "status",
@@ -131,6 +133,7 @@ def extract_phase_checkpoint_findings(
             "poc_code",
             "poc_verified",
             "verdict",
+            "duplicate_of",
         ):
             val = latest.get(key) if key in latest else nested.get(key)
             if val is not None:
@@ -380,6 +383,24 @@ def compute_inter_rater_stats(pool: list[CanonicalFinding]) -> InterRaterStats:
     return stats
 
 
+def _extract_duplicate_of_id(vuln: dict) -> str:
+    """Extracts the canonical finding ID referenced by duplicate_of on a finding or its phase history."""
+    raw = vuln.get("duplicate_of")
+    if not raw:
+        for h in reversed(vuln.get("history", [])):
+            if isinstance(h, dict):
+                raw = h.get("duplicate_of") or (
+                    h.get("finding", {}).get("duplicate_of")
+                    if isinstance(h.get("finding"), dict)
+                    else None
+                )
+                if raw:
+                    break
+    if not raw:
+        return ""
+    return str(raw).strip().split("/")[-1]
+
+
 class FindingPooler:
     """Clusters findings across all trials and checkpoints into a provenance-stripped blind review deck."""
 
@@ -404,13 +425,42 @@ class FindingPooler:
             except Exception as e:
                 logger.warning(f"Could not load existing blind review pool from {pool_file}: {e}")
 
+        # Pre-link intra-run duplicate_of chains across all trials and checkpoints so cross-file /
+        # cross-line duplicates identified by Mjolnir's DeduplicationAgent map to the same root cause.
+        dup_parent_map: dict[tuple[str, int, str], str] = {}
+        for trial in trials:
+            base_tier = trial.ablation_tier.split("@")[0]
+            for vuln in trial.findings:
+                fid = str(vuln.get("id") or "")
+                dup_of = _extract_duplicate_of_id(vuln)
+                if fid and dup_of and dup_of != fid:
+                    dup_parent_map[(base_tier, trial.repetition, fid)] = dup_of
+
+        def _resolve_root_fid(b_tier: str, rep_num: int, fid: str) -> str:
+            cur = fid
+            visited: set[str] = {cur}
+            while (b_tier, rep_num, cur) in dup_parent_map:
+                nxt = dup_parent_map[(b_tier, rep_num, cur)]
+                if not nxt or nxt in visited:
+                    break
+                visited.add(nxt)
+                cur = nxt
+            return cur
+
         clusters: list[
             tuple[CanonicalFinding, list[FindingOccurrence], set[tuple[str, int, str]]]
         ] = []
 
         for trial in trials:
             base_tier = trial.ablation_tier.split("@")[0]
-            for vuln in trial.findings:
+            # Process canonical root findings before findings marked duplicate_of
+            ordered_findings = sorted(
+                trial.findings,
+                key=lambda v: 1
+                if (base_tier, trial.repetition, str(v.get("id") or "")) in dup_parent_map
+                else 0,
+            )
+            for vuln in ordered_findings:
                 raw_file = (
                     str(vuln.get("file") or vuln.get("file_path") or "")
                     .replace("\\", "/")
@@ -419,6 +469,9 @@ class FindingPooler:
                 if not raw_file:
                     continue
                 finding_id = str(vuln.get("id") or "")
+                root_fid = (
+                    _resolve_root_fid(base_tier, trial.repetition, finding_id) if finding_id else ""
+                )
                 cwe_str = extract_cwe_from_vuln(vuln)
                 loc_str = str(vuln.get("location") or "Line 1")
                 start_ln, end_ln = parse_line_range(loc_str)
@@ -445,10 +498,13 @@ class FindingPooler:
                     raw_location=loc_str,
                 )
                 run_identity = (base_tier, trial.repetition, finding_id)
+                root_identity = (base_tier, trial.repetition, root_fid)
 
                 matched_idx = None
                 for idx, (canon, _occs, run_ids) in enumerate(clusters):
-                    if finding_id and run_identity in run_ids:
+                    if (finding_id and run_identity in run_ids) or (
+                        root_fid and root_identity in run_ids
+                    ):
                         matched_idx = idx
                         break
                     if self._findings_equivalent(
@@ -469,6 +525,8 @@ class FindingPooler:
                     occs.append(occ)
                     if finding_id:
                         run_ids.add(run_identity)
+                    if root_fid:
+                        run_ids.add(root_identity)
                     # Enrich canonical finding if a later checkpoint has fuller details or CWE
                     if not canon.cwe and cwe_str:
                         canon.cwe = cwe_str
@@ -498,7 +556,11 @@ class FindingPooler:
                         attack_vector=attack_vec_str,
                         recommendation=rec_str,
                     )
-                    id_set = {run_identity} if finding_id else set()
+                    id_set: set[tuple[str, int, str]] = set()
+                    if finding_id:
+                        id_set.add(run_identity)
+                    if root_fid:
+                        id_set.add(root_identity)
                     clusters.append((new_canon, [occ], id_set))
 
         # Deterministic hash order so blind review cards do not leak tool execution order
@@ -587,8 +649,20 @@ class FindingPooler:
         loc_tokens_b = keyword_tokens(loc_str) - {"line", "lines", "function"}
         shared_func = bool(loc_tokens_a and loc_tokens_b and (loc_tokens_a & loc_tokens_b))
 
+        cwe_equiv = bool(
+            canon.cwe and cwe_str and self.cwe_matcher.are_equivalent(canon.cwe, cwe_str)
+        )
+        toks_a = keyword_tokens(f"{canon.title} {canon.description}")
+        toks_b = keyword_tokens(f"{title_str} {desc_str}")
+        kw_jaccard = (len(toks_a & toks_b) / len(toks_a | toks_b)) if (toks_a and toks_b) else 0.0
+
         if not span_overlap and not shared_func:
-            if canon.start_line is not None and start_ln is not None:
+            if (
+                canon.start_line is not None
+                and start_ln is not None
+                and not cwe_equiv
+                and kw_jaccard < 0.25
+            ):
                 return False
 
         # Step 2: Semantic Root-Cause Equivalence
@@ -604,18 +678,11 @@ class FindingPooler:
             if verdict is not None:
                 return verdict.is_match
 
-        cwe_equiv = bool(
-            canon.cwe and cwe_str and self.cwe_matcher.are_equivalent(canon.cwe, cwe_str)
-        )
-        if cwe_equiv and (span_overlap or shared_func):
+        if cwe_equiv and (span_overlap or shared_func or kw_jaccard >= 0.35):
             return True
 
-        toks_a = keyword_tokens(f"{canon.title} {canon.description}")
-        toks_b = keyword_tokens(f"{title_str} {desc_str}")
-        if toks_a and toks_b:
-            jaccard = len(toks_a & toks_b) / len(toks_a | toks_b)
-            if jaccard >= 0.30 and (span_overlap or shared_func or not canon.start_line):
-                return True
+        if kw_jaccard >= 0.30 and (span_overlap or shared_func or not canon.start_line):
+            return True
 
         if (
             canon.start_line is not None
