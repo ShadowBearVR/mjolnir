@@ -12,8 +12,8 @@
    - Automatically reconstructs intermediate phase checkpoints (`@discovery`, `@deduplication`, `@initial_review` [`no_poc`/`fast`], `@poc_creation`, `@final_review`) directly from `Vulnerability.history`.
    - Computes phase-by-phase entering/surviving counts, close rates, deduplication rates, PoC verification counts, and severity shift matrices (upgrades vs. downgrades).
 
-2. **Controlled Single-Agent ADK & CLI Baselines**:
-   - Evaluates controlled single-agent ADK baselines (`holistic_no_tm`, `holistic`, `per_file_no_tm`, `per_file`) using the exact same model and temperature as Mjolnir, as well as optional CLI template baselines (`antigravity`, `claude`, `codex`, `gemini`, `openant`).
+2. **Controlled Single-Agent ADK Baselines**:
+   - Evaluates controlled single-agent ADK baselines (`holistic_no_tm`, `holistic`, `per_file_no_tm`, `per_file`) using the exact same model and temperature as Mjolnir.
 
 3. **Blind Dual-Expert Review Pooler & Cohen's $\kappa$ (`grader.py`)**:
    - **Step 1 (Localization Filter)**: Clusters candidate findings across all tools, tiers, and repetitions by file path and line/function span (`±35` lines).

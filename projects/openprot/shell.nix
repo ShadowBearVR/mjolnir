@@ -30,6 +30,13 @@ pkgs.mkShell {
   PIP_CONFIG_FILE = "/dev/null";
 
   shellHook = ''
+    export PKG_CONFIG_PATH="${pkgs.zlib.dev}/lib/pkgconfig:${pkgs.openssl.dev}/lib/pkgconfig"
+    export OPENSSL_LIB_DIR="${pkgs.openssl.out}/lib"
+    export OPENSSL_INCLUDE_DIR="${pkgs.openssl.dev}/include"
+    export CPATH="${pkgs.zlib.dev}/include:${pkgs.openssl.dev}/include"
+    export LIBRARY_PATH="${pkgs.zlib}/lib:${pkgs.openssl.out}/lib"
+    export PIP_CONFIG_FILE="/dev/null"
+
     # Shared Bazel caches across isolated PoC worktrees
     export SHARED_DISK_CACHE="/tmp/openprot-bazel-shared-disk"
     export SHARED_REPO_CACHE="/tmp/openprot-bazel-shared-repo"
