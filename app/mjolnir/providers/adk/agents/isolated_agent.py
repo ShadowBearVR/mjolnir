@@ -1,18 +1,33 @@
 # Licensed under the Apache-2.0 license
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+from functools import cached_property
 import json
+import os
+import random
 import re
 from typing import Any, Optional
 from google.adk import Agent
+from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.agents.invocation_context import (
     InvocationContext,
     _InvocationCostManager,
 )
 from google.adk.agents.run_config import RunConfig
 from google.adk.models import BaseLlm, LLMRegistry, LlmRequest
+from google.adk.models.anthropic_llm import Claude
 from google.adk.models.google_llm import Gemini
 from google.adk.tools.set_model_response_tool import SetModelResponseTool
 from google.genai import types
+
+LLMRegistry.register(Claude)
+try:
+    from google.adk.telemetry import _otel_compat
+
+    if not hasattr(_otel_compat.GenAiSystemValues, "ANTHROPIC"):
+        _otel_compat.GenAiSystemValues.ANTHROPIC = _otel_compat.DummyAttr("anthropic")
+except Exception:
+    pass
 
 from constants import (
     DEFAULT_RETRY_ATTEMPTS,
@@ -86,6 +101,104 @@ class CachedGemini(Gemini):
                 yield resp
 
 
+class CachedClaude(Claude):
+    """ADK Claude-on-Vertex wrapper with automatic ADC project resolution, prompt caching, adaptive thinking, and retry backoff."""
+
+    max_tokens: int = 16384
+
+    @cached_property
+    def _anthropic_client(self):
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            try:
+                import google.auth
+
+                _, proj = google.auth.default()
+                if proj:
+                    os.environ["GOOGLE_CLOUD_PROJECT"] = proj
+            except Exception:
+                pass
+        if not os.environ.get("GOOGLE_CLOUD_LOCATION"):
+            os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
+        return super()._anthropic_client
+
+    async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+        if llm_request.cache_config is None:
+            llm_request.cache_config = ContextCacheConfig(min_tokens=1024, ttl_seconds=300)
+        if llm_request.config:
+            llm_request.config.cached_content = None
+            resp_schema = getattr(llm_request.config, "response_schema", None)
+            if resp_schema and "set_model_response" not in llm_request.tools_dict:
+                llm_request.tools_dict["set_model_response"] = SetModelResponseTool(resp_schema)
+            if getattr(llm_request.config, "thinking_config", None) is None:
+                llm_request.config.thinking_config = types.ThinkingConfig(
+                    include_thoughts=True, thinking_budget=-1
+                )
+            if getattr(llm_request.config, "tools", None):
+                for tool_entry in llm_request.config.tools:
+                    if fns := getattr(tool_entry, "function_declarations", None):
+                        tool_entry.function_declarations = list(
+                            {getattr(f, "name", id(f)): f for f in fns}.values()
+                        )
+
+        delay = float(DEFAULT_RETRY_INITIAL_DELAY)
+        for attempt in range(1, DEFAULT_RETRY_ATTEMPTS + 1):
+            try:
+                async for resp in super().generate_content_async(llm_request, stream=stream):
+                    um = getattr(resp, "usage_metadata", None)
+                    parts = getattr(getattr(resp, "content", None), "parts", None) or []
+                    if (
+                        um is not None
+                        and not getattr(resp, "partial", False)
+                        and getattr(um, "thoughts_token_count", None) is None
+                        and (um.candidates_token_count or 0) > 0
+                    ):
+                        thought_chars = sum(
+                            len(getattr(p, "text", "") or "")
+                            for p in parts
+                            if getattr(p, "thought", False)
+                        )
+                        if thought_chars > 0:
+                            out_chars = sum(
+                                len(getattr(p, "text", "") or "")
+                                + (
+                                    len(json.dumps(p.function_call.args or {}))
+                                    + len(p.function_call.name or "")
+                                    if getattr(p, "function_call", None)
+                                    else 0
+                                )
+                                for p in parts
+                                if not getattr(p, "thought", False)
+                            )
+                            tot_out = int(um.candidates_token_count or 0)
+                            tot_chars = thought_chars + out_chars
+                            est_think = (
+                                max(1, int(round(tot_out * (thought_chars / tot_chars))))
+                                if tot_chars > 0
+                                else 0
+                            )
+                            est_think = min(tot_out, est_think)
+                            um.thoughts_token_count = est_think
+                            um.candidates_token_count = tot_out - est_think
+                    yield resp
+                return
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                retryable = status in (408, 429, 500, 502, 503, 504, 529) or any(
+                    tok in str(e).lower()
+                    for tok in ("rate limit", "overloaded", "timeout", "connection", "529", "429")
+                )
+                if not retryable or attempt >= DEFAULT_RETRY_ATTEMPTS:
+                    raise
+                sleep_s = min(float(DEFAULT_RETRY_MAX_DELAY), delay) * (
+                    0.75 + 0.5 * random.random()
+                )
+                logger.warning(
+                    f"Claude API transient error (attempt {attempt}/{DEFAULT_RETRY_ATTEMPTS}): {e}; retrying in {sleep_s:.1f}s"
+                )
+                await asyncio.sleep(sleep_s)
+                delay *= 2.0
+
+
 def resolve_model_with_retries(model: str | BaseLlm) -> BaseLlm:
     """Polymorphically ensures any model (string name or instantiated BaseLlm) has transport-level retry options configured."""
     # 1. If passed an already-instantiated BaseLlm
@@ -95,9 +208,13 @@ def resolve_model_with_retries(model: str | BaseLlm) -> BaseLlm:
         return model
 
     # 2. If passed a string model name, resolve class dynamically via ADK registry
+    if isinstance(model, str) and model.startswith("vertex_ai/claude-"):
+        model = model.split("/", 1)[1]
     llm_class = LLMRegistry.resolve(model)
     if issubclass(llm_class, Gemini):
         return CachedGemini(model=model, retry_options=DEFAULT_HTTP_RETRY_OPTIONS)
+    if issubclass(llm_class, Claude):
+        return CachedClaude(model=model)
 
     # 3. Duck-type check if this provider class accepts `retry_options`
     if "retry_options" in getattr(llm_class, "model_fields", {}):

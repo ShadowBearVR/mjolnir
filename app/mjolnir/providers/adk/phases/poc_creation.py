@@ -169,7 +169,9 @@ async def poc_creation_phase(
                     f"Skipped: Severity ({v.severity.value}) is below minimum PoC threshold ({min_poc_severity}).",
                 )
         ctx.state["vulnerabilities"] = vulnerabilities
-        checkpoint_audit_findings(ctx, vulnerabilities, phase_id)
+        await checkpoint_audit_findings(
+            vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
+        )
         return vulnerabilities
 
     exploiter_tools = get_exploiter_tools(enable_project_expert=enable_project_expert)

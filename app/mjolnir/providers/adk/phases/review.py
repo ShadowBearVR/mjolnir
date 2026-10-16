@@ -77,7 +77,9 @@ async def _run_review_pass(
             else:
                 v.add_skipped(phase_id, phase_name, "Skipped: No PoC generated for this finding.")
         ctx.state["vulnerabilities"] = vulnerabilities
-        checkpoint_audit_findings(ctx, vulnerabilities, phase_id)
+        await checkpoint_audit_findings(
+            vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
+        )
         return vulnerabilities
 
     reviewer_tools = get_reviewer_tools(enable_project_expert=enable_project_expert)

@@ -161,6 +161,7 @@ def run_analysis(
     bucket: str = None,
     project_name: str = None,
     project_output_dir: str = None,
+    phase_ids: list[str] | None = None,
     test_path_tokens: list[str] | None = None,
 ) -> tuple[list[Vulnerability], str]:
     """ADK 2.0 provider pipeline: executes a multi-node workflow graph."""
@@ -179,8 +180,12 @@ def run_analysis(
     except Exception as e:
         logger.warning(f"Could not inspect ADK client metadata: {e}")
 
-    enable_project_expert = mode == PIPELINE_MODE_FULL
-    analysis_workflow = build_analysis_workflow(mode=mode, ingest_path=ingest_path)
+    if phase_ids:
+        enable_project_expert = PHASE_EXPLORATION_ID in phase_ids
+        analysis_workflow = build_composable_workflow(phase_ids=phase_ids)
+    else:
+        enable_project_expert = mode == PIPELINE_MODE_FULL
+        analysis_workflow = build_analysis_workflow(mode=mode, ingest_path=ingest_path)
 
     session_service = InMemorySessionService()
     runner = Runner(

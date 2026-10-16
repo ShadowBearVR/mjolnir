@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -376,10 +377,110 @@ class WorktreeSandbox:
                 env["CARGO_TARGET_DIR"] = str(cache_target)
         return env
 
+    def validate_harness_command(self, command: str) -> str | None:
+        """Validates that a harness command only executes build/test tools within the sandbox workspace.
+
+        Returns an error message if out-of-workspace path traversal or disallowed shell
+        filesystem exploration is detected, or None if the command is permitted.
+        """
+        stripped = command.strip()
+        if not stripped:
+            return "Empty harness command."
+
+        disallowed_bins = {
+            "find",
+            "locate",
+            "mlocate",
+            "plocate",
+            "grep",
+            "egrep",
+            "fgrep",
+            "rg",
+            "ag",
+            "ack",
+            "cat",
+            "head",
+            "tail",
+            "less",
+            "more",
+            "ls",
+            "tree",
+            "du",
+            "df",
+        }
+        try:
+            tokens = shlex.split(stripped, posix=True)
+        except ValueError:
+            tokens = stripped.split()
+
+        # 1. Check command verbs at the start of the command and after shell control operators
+        expect_cmd = True
+        for tok in tokens:
+            if tok in (";", "&&", "||", "|", "&"):
+                expect_cmd = True
+                continue
+            if expect_cmd:
+                if "=" in tok and not tok.startswith(("/", ".", "-")):
+                    continue
+                cmd_name = Path(tok).name.lower()
+                if cmd_name in disallowed_bins:
+                    return (
+                        f"Access denied: '{cmd_name}' is not permitted in run_harness_command. "
+                        "Use workspace-scoped tools (read_file, grep_files, list_files, query_symbols) "
+                        "to inspect source files, and use run_harness_command strictly for build/test "
+                        "execution (e.g., cargo test, bazel test, verilator, make)."
+                    )
+                expect_cmd = False
+
+        # 2. Check all tokens for paths escaping the sandbox workspace
+        allowed_roots = (
+            self.worktree_dir.resolve(),
+            self.workspace_dir.resolve(),
+            self.source_code_dir.resolve(),
+            Path("/nix/store"),
+            Path("/dev"),
+        )
+        for tok in tokens:
+            # Strip leading flag assignment like --manifest-path=/foo or -I/foo
+            candidate = tok.split("=", 1)[1] if "=" in tok and tok.startswith("-") else tok
+            if not candidate or candidate.startswith("//"):
+                # Bazel target label like //sw/device/...
+                continue
+            if (
+                candidate.startswith(("/", "~", "../"))
+                or "/../" in candidate
+                or candidate == ".."
+                or candidate.endswith("/..")
+            ):
+                expanded = Path(os.path.expanduser(candidate))
+                resolved = (
+                    expanded.resolve()
+                    if expanded.is_absolute()
+                    else (self.worktree_dir / expanded).resolve()
+                )
+                if not any(
+                    resolved == root or resolved.is_relative_to(root) for root in allowed_roots
+                ):
+                    return (
+                        f"Access denied: Path '{tok}' resolves outside the isolated repository "
+                        f"workspace ({self.worktree_dir}). All harness commands must remain "
+                        "strictly within the repository workspace."
+                    )
+        return None
+
     async def run_harness_command_async(
         self, command: str, timeout_seconds: int = HARNESS_COMMAND_TIMEOUT_SECONDS
     ) -> CommandRecord:
         """Executes a test harness command inside the isolated sandbox and records its output."""
+        violation = self.validate_harness_command(command)
+        if violation is not None:
+            logger.warning(f"      [PoC Sandbox] Blocked command: {command} ({violation})")
+            return CommandRecord(
+                command=command,
+                returncode=126,
+                output=violation,
+            )
+
         effective_timeout = max(5, min(timeout_seconds, HARNESS_COMMAND_TIMEOUT_SECONDS))
         env = self._build_env()
 

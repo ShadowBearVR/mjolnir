@@ -13,11 +13,11 @@ import urllib.error
 import urllib.request
 
 # Matches https://github.com/<owner>/<repo>/pull/<number>
-# Example: "https://github.com/chipsalliance/mjolnir/pull/123" -> ("chipsalliance/mjolnir", "123")
+# Example: "https://github.com/chipsalliance/caliptra-sw/pull/123" -> ("chipsalliance/caliptra-sw", "123")
 _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
 
 # Matches https://github.com/<owner>/<repo>(.git)
-# Example: "https://github.com/chipsalliance/mjolnir.git" -> "chipsalliance/mjolnir"
+# Example: "https://github.com/chipsalliance/caliptra-sw.git" -> "chipsalliance/caliptra-sw"
 _REPO_URL_RE = re.compile(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?/?$")
 
 # Matches the first positive integer line number in a finding's `location` string.
