@@ -680,7 +680,7 @@ class FindingPooler:
                                 if vertexai
                                 else None,
                                 http_options=types.HttpOptions(
-                                    timeout=30000,
+                                    timeout=45000,
                                     retry_options=types.HttpRetryOptions(
                                         attempts=3, initial_delay=1.0, max_delay=10.0
                                     ),
@@ -690,7 +690,7 @@ class FindingPooler:
                         if len(cand_canons) > 1:
                             from concurrent.futures import ThreadPoolExecutor
 
-                            with ThreadPoolExecutor(max_workers=min(8, len(cand_canons))) as ex:
+                            with ThreadPoolExecutor(max_workers=min(4, len(cand_canons))) as ex:
                                 results = list(
                                     ex.map(
                                         lambda item: self._findings_equivalent(
@@ -943,7 +943,21 @@ class FindingPooler:
                 return False
 
         # Step 2: CWE Hierarchy or Semantic Root-Cause Equivalence
-        if cwe_equiv and (span_overlap or shared_func or kw_jaccard >= 0.35):
+        if cwe_equiv and (
+            ((span_overlap or shared_func) and kw_jaccard >= 0.25) or kw_jaccard >= 0.35
+        ):
+            return True
+
+        if kw_jaccard >= 0.30 and (span_overlap or shared_func or not canon.start_line):
+            return True
+
+        if (
+            canon.start_line is not None
+            and start_ln is not None
+            and abs(canon.start_line - start_ln) <= 10
+            and (not canon.cwe or not cwe_str or cwe_equiv)
+            and kw_jaccard >= 0.25
+        ):
             return True
 
         if not use_llm:
@@ -964,17 +978,6 @@ class FindingPooler:
             )
             if verdict is not None:
                 return verdict.is_match
-
-        if kw_jaccard >= 0.30 and (span_overlap or shared_func or not canon.start_line):
-            return True
-
-        if (
-            canon.start_line is not None
-            and start_ln is not None
-            and abs(canon.start_line - start_ln) <= 10
-            and (not canon.cwe or not cwe_str or cwe_equiv)
-        ):
-            return True
 
         return False
 
@@ -1036,7 +1039,7 @@ class FindingPooler:
                     if vertexai
                     else None,
                     http_options=types.HttpOptions(
-                        timeout=30000,
+                        timeout=45000,
                         retry_options=types.HttpRetryOptions(
                             attempts=3, initial_delay=1.0, max_delay=10.0
                         ),
@@ -1055,7 +1058,9 @@ class FindingPooler:
                     ),
                     response_mime_type="application/json",
                     response_schema=RootCauseJudgeVerdict,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    thinking_config=None
+                    if "argon" in (self.judge_model or "")
+                    else types.ThinkingConfig(thinking_budget=0),
                 ),
             )
             parsed = getattr(resp, "parsed", None) or (
