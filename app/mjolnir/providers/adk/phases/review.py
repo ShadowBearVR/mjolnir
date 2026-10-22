@@ -64,7 +64,6 @@ async def _run_review_pass(
     ]
     has_eligible = any(
         getattr(v, "status", Status.OPEN) == Status.OPEN
-        and (not evaluate_poc or bool(v.poc))
         and not (not evaluate_poc and any(h.phase_id == phase_id for h in v.history))
         for v in vulnerabilities
     )
@@ -74,8 +73,6 @@ async def _run_review_pass(
                 continue
             if getattr(v, "status", Status.OPEN) != Status.OPEN:
                 v.add_skipped(phase_id, phase_name, f"Skipped: Status is {v.status}")
-            else:
-                v.add_skipped(phase_id, phase_name, "Skipped: No PoC generated for this finding.")
         ctx.state["vulnerabilities"] = vulnerabilities
         await checkpoint_audit_findings(
             vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
@@ -117,18 +114,14 @@ async def _run_review_pass(
             if not evaluate_poc and any(h.phase_id == phase_id for h in vuln.history):
                 return vuln
 
-            if evaluate_poc and not vuln.poc:
-                vuln.add_skipped(
-                    phase_id,
-                    phase_name,
-                    "Skipped: No PoC generated for this finding.",
-                )
-                return vuln
-
             exclude_fields = set() if evaluate_poc else {"poc"}
             finding_payload = vuln.model_dump_json(indent=2, exclude=exclude_fields)
-            if evaluate_poc and vuln.poc:
-                poc_content = vuln.poc
+            if evaluate_poc:
+                poc_content = (
+                    vuln.poc
+                    if vuln.poc
+                    else "[NO POC GENERATED — Dynamic verification test synthesis did not produce a test artifact; perform final adversarial static verification directly against the codebase and threat model.]"
+                )
                 if len(poc_content) > MAX_REVIEW_POC_PROMPT_CHARS:
                     half = MAX_REVIEW_POC_PROMPT_CHARS // 2
                     poc_content = (

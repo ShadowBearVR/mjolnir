@@ -19,7 +19,6 @@ in
   threatModel = "${src}/tools/mjolnir/threat_model.md";
 
   evaluatorModel = "gemini-3.8-flash";
-  judgeModel = "gemini-3.8-flash";
   minPocSeverity = "Informational";
   batchSize = prodProject.defaultBatchSize or 64;
   extensions = [ "rs" ];

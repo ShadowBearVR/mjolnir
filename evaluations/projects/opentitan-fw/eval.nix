@@ -20,7 +20,6 @@ in
   targetDir = "sw/device/silicon_creator/rom_ext";
 
   evaluatorModel = "gemini-3.8-flash";
-  judgeModel = "gemini-3.8-flash";
   minPocSeverity = "Informational";
   batchSize = 64;
   extensions = [ "c" "h" "rs" ];

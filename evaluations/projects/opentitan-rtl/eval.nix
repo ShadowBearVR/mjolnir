@@ -20,7 +20,6 @@ in
   targetDir = "hw/top_earlgrey";
 
   evaluatorModel = "gemini-3.8-flash";
-  judgeModel = "gemini-3.8-flash";
   minPocSeverity = "Informational";
   batchSize = 64;
   extensions = [ "sv" ];

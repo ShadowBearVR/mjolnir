@@ -36,6 +36,49 @@ from utilities.logger import logger
 class ScorecardGenerator:
     """Joins trial manifests with blind review labels to compute RQ1-RQ4 USENIX Security scorecards."""
 
+    TOOL_CATEGORY_MAP: dict[str, str] = {
+        "read_file": "file",
+        "glob": "file",
+        "grep_search": "search",
+        "ctags_search": "search",
+        "ast_search": "search",
+        "search_cwe": "cwe",
+        "ask_project_expert": "project_expert",
+        "patch_worktree_file": "worktree",
+        "write_worktree_file": "worktree",
+        "get_worktree_diff": "worktree",
+        "reset_worktree": "worktree",
+        "run_harness_command": "harness",
+    }
+    TOOL_CATEGORIES: tuple[str, ...] = (
+        "file",
+        "search",
+        "cwe",
+        "project_expert",
+        "worktree",
+        "harness",
+        "other",
+    )
+    SAFETY_REFUSAL_MARKERS: tuple[str, ...] = (
+        "cannot fulfill your request",
+        "cannot fulfill this request",
+        "unable to fulfill",
+        "cannot assist",
+        "adhere to the strict refusal",
+        "adhere to the strictest safety",
+        "must refuse",
+        "refusal justification",
+        "prevent real-world harm",
+        "i cannot provide",
+        "sorry, i cannot",
+        "safety policy",
+        "prohibits generating",
+        "unable to generate functional exploit",
+    )
+
+    def __init__(self) -> None:
+        self._telemetry_cache: dict[str, dict] = {}
+
     MODEL_PRICING_SCHEDULES_USD_PER_1M: dict[str, dict[str, float | str]] = {
         "gemini-3.8-flash": {
             "uncached_input": 0.75,
@@ -132,6 +175,355 @@ class ScorecardGenerator:
                 pass
         return 0, int(trial.output_tokens)
 
+    @classmethod
+    def _infer_phase_from_target_id(cls, target_id: str) -> str:
+        tid = str(target_id or "")
+        if tid == "project_exploration":
+            return "project_exploration"
+        if ".ProjectExpertAgent@" in tid:
+            caller = tid.split(".ProjectExpertAgent@", 1)[0]
+            return cls._infer_phase_from_target_id(caller)
+        if tid.startswith("expert_query_"):
+            return "discovery"
+        if tid == "deduplication":
+            return "deduplication"
+        if tid.startswith("initial_review"):
+            return "initial_review"
+        if tid.startswith("poc_creation") or tid.startswith("poc_"):
+            return "poc_creation"
+        if tid.startswith("final_review"):
+            return "final_review"
+        return "discovery"
+
+    @classmethod
+    def _categorize_tool(cls, tool_name: str) -> str | None:
+        if tool_name == "set_model_response":
+            return None
+        return cls.TOOL_CATEGORY_MAP.get(tool_name, "other")
+
+    def _load_trial_telemetry(
+        self,
+        eval_dir: Path | None = None,
+        base_tier: str = "",
+        repetition: int = 1,
+        trial_findings: list[dict] | None = None,
+        rep_dir: Path | None = None,
+    ) -> dict:
+        """Loads or reconstructs LLM-call, tool-call, Project Expert, PoC-gate, and refusal telemetry for a trial."""
+        if rep_dir is None:
+            assert eval_dir is not None
+            rep_dir = eval_dir / "trials" / base_tier / f"rep_{repetition}"
+        cache_key = (
+            str(rep_dir.resolve()) if rep_dir.exists() else f"{eval_dir}:{base_tier}:{repetition}"
+        )
+        if cache_key in self._telemetry_cache:
+            return self._telemetry_cache[cache_key]
+
+        empty_cats = {c: 0 for c in self.TOOL_CATEGORIES}
+        phases_list = (
+            "project_exploration",
+            "discovery",
+            "deduplication",
+            "initial_review",
+            "poc_creation",
+            "final_review",
+        )
+        result: dict = {
+            "has_telemetry": False,
+            "llm_calls_total": 0,
+            "llm_calls_by_agent": {},
+            "llm_calls_by_phase": {p: 0 for p in phases_list},
+            "tool_calls_total": 0,
+            "tool_errors_total": 0,
+            "tool_calls_by_category": dict(empty_cats),
+            "tool_calls_by_phase": {p: 0 for p in phases_list},
+            "tool_errors_by_phase": {p: 0 for p in phases_list},
+            "tool_categories_by_phase": {p: dict(empty_cats) for p in phases_list},
+            "expert_questions": 0,
+            "expert_cache_hits": 0,
+            "expert_zero_tool_subruns": 0,
+            "expert_answered_from_history": 0,
+            "poc_attempts": 0,
+            "poc_harness_commands": 0,
+            "poc_gate_failures": 0,
+            "refusals": {
+                "total_safety_refusals": 0,
+                "hard_safety_refusals": 0,
+                "soft_refusals": 0,
+                "api_safety_blocks": 0,
+                "schema_validation_drops": 0,
+                "by_agent": {},
+            },
+        }
+        if not rep_dir.is_dir():
+            self._telemetry_cache[cache_key] = result
+            return result
+
+        run_dirs = sorted(p for p in rep_dir.glob("run_*") if p.is_dir())
+        td = run_dirs[-1] if run_dirs else rep_dir
+        tok_p = td / "token_usage.json"
+        tool_p = td / "tool_usage.json"
+        rlog_p = td / "reasoning_log.json"
+        vulns_p = td / "vulnerabilities.json"
+        if not vulns_p.exists() and (rep_dir / "vulnerabilities.json").exists():
+            vulns_p = rep_dir / "vulnerabilities.json"
+
+        tok = json.loads(tok_p.read_text(encoding="utf-8")) if tok_p.exists() else {}
+        tool = json.loads(tool_p.read_text(encoding="utf-8")) if tool_p.exists() else {}
+        rlog = json.loads(rlog_p.read_text(encoding="utf-8")) if rlog_p.exists() else {}
+        vulns = (
+            json.loads(vulns_p.read_text(encoding="utf-8"))
+            if vulns_p.exists()
+            else list(trial_findings or [])
+        )
+        if not (tok or tool or rlog):
+            self._telemetry_cache[cache_key] = result
+            return result
+        result["has_telemetry"] = True
+
+        # 1. Tool calls & errors from tool_usage.json (excluding ADK's synthetic set_model_response)
+        by_tool = tool.get("by_tool") or {}
+        for t_name, st in by_tool.items():
+            calls = int(st.get("calls", 0) or 0)
+            fails = int(st.get("failures", 0) or 0)
+            cat = self._categorize_tool(t_name)
+            if cat is not None:
+                result["tool_calls_total"] += calls
+                result["tool_errors_total"] += fails
+                result["tool_calls_by_category"][cat] += calls
+
+        result["expert_questions"] = int(
+            (by_tool.get("ask_project_expert") or {}).get("calls", 0) or 0
+        )
+        result["poc_harness_commands"] = int(
+            (by_tool.get("run_harness_command") or {}).get("calls", 0) or 0
+        )
+
+        # Per-phase tool calls from tool_usage["by_phase"] when recorded directly
+        by_phase_tools = tool.get("by_phase") or {}
+        has_direct_phase_tools = bool(by_phase_tools)
+        if has_direct_phase_tools:
+            for pid, p_tools in by_phase_tools.items():
+                if pid not in result["tool_calls_by_phase"] or not isinstance(p_tools, dict):
+                    continue
+                for t_name, st in p_tools.items():
+                    cat = self._categorize_tool(t_name)
+                    if cat is None:
+                        continue
+                    c = int(st.get("calls", 0) or 0)
+                    f_cnt = int(st.get("failures", 0) or 0)
+                    result["tool_calls_by_phase"][pid] += c
+                    result["tool_errors_by_phase"][pid] += f_cnt
+                    result["tool_categories_by_phase"][pid][cat] += c
+
+        # 2. Direct LLM-call counts if recorded in token_usage.json
+        tot_llm_direct = int((tok.get("total") or {}).get("llm_calls", 0) or 0)
+        if tot_llm_direct > 0:
+            result["llm_calls_total"] = tot_llm_direct
+            for ag, a_st in (tok.get("by_agent") or {}).items():
+                c_ag = int((a_st or {}).get("llm_calls", 0) or 0)
+                if c_ag > 0 and ag != "MjolnirComposableWorkflow":
+                    result["llm_calls_by_agent"][ag] = c_ag
+            for pid, p_st in (tok.get("by_phase") or {}).items():
+                if pid in result["llm_calls_by_phase"]:
+                    result["llm_calls_by_phase"][pid] = int((p_st or {}).get("llm_calls", 0) or 0)
+
+        # 3. Direct refusal counts if recorded in token_usage.json
+        direct_ref = tok.get("refusals")
+        has_direct_ref = isinstance(direct_ref, dict) and (
+            "hard_safety_refusals" in direct_ref or "total_safety_refusals" in direct_ref
+        )
+        if has_direct_ref:
+            for k in (
+                "total_safety_refusals",
+                "hard_safety_refusals",
+                "soft_refusals",
+                "api_safety_blocks",
+                "schema_validation_drops",
+            ):
+                result["refusals"][k] = int(direct_ref.get(k, 0) or 0)
+            for ag, ag_b in (direct_ref.get("by_agent") or {}).items():
+                if isinstance(ag_b, dict):
+                    result["refusals"]["by_agent"][ag] = {
+                        k: int(ag_b.get(k, 0) or 0)
+                        for k in (
+                            "total_safety_refusals",
+                            "hard_safety_refusals",
+                            "soft_refusals",
+                            "api_safety_blocks",
+                            "schema_validation_drops",
+                        )
+                    }
+        else:
+            for err_k, cnt in (tok.get("errors_grouped") or {}).items():
+                u_err = str(err_k).upper()
+                if (
+                    any(w in u_err for w in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"))
+                    and "HARDSAFETYREFUSAL" not in u_err
+                    and "SOFTREFUSAL" not in u_err
+                ):
+                    result["refusals"]["api_safety_blocks"] += int(cnt or 0)
+                    result["refusals"]["total_safety_refusals"] += int(cnt or 0)
+
+        # 4. Inspect reasoning_log.json for retroactive LLM turns, phase tools, expert Q&A, PoC claims, and refusals
+        expert_subruns = 0
+        expert_zero_tools = 0
+        claimed_poc_verified_ids: set[str] = set()
+        seen_soft_refusal_targets: set[str] = set()
+        err_prefixes = ("Error:", "Error executing", "Error ")
+
+        def _bump_agent_refusal(ag_name: str, r_kind: str) -> None:
+            b = result["refusals"]["by_agent"].setdefault(
+                ag_name,
+                {
+                    "total_safety_refusals": 0,
+                    "hard_safety_refusals": 0,
+                    "soft_refusals": 0,
+                    "api_safety_blocks": 0,
+                    "schema_validation_drops": 0,
+                },
+            )
+            b[r_kind] += 1
+            if r_kind != "schema_validation_drops":
+                b["total_safety_refusals"] += 1
+
+        for tid, entries in rlog.items():
+            if not isinstance(entries, list) or not entries:
+                continue
+            pid = self._infer_phase_from_target_id(tid)
+            in_turn = False
+            for e in entries:
+                etype = e.get("type")
+                ag = str(e.get("agent") or "UnknownAgent")
+                if etype in ("thought", "output", "tool_call", "refusal"):
+                    if tot_llm_direct == 0 and not in_turn:
+                        if ag != "MjolnirComposableWorkflow":
+                            result["llm_calls_total"] += 1
+                            result["llm_calls_by_agent"][ag] = (
+                                result["llm_calls_by_agent"].get(ag, 0) + 1
+                            )
+                            if pid in result["llm_calls_by_phase"]:
+                                result["llm_calls_by_phase"][pid] += 1
+                        in_turn = True
+                    if etype == "tool_call" and e.get("tool") == "set_model_response":
+                        args_d = e.get("args") if isinstance(e.get("args"), dict) else {}
+                        if tid.startswith("poc_creation_") and args_d.get("poc_verified") is True:
+                            claimed_poc_verified_ids.add(tid[len("poc_creation_") :])
+                        if not has_direct_ref and args_d.get("refusal_reason"):
+                            seen_soft_refusal_targets.add(tid)
+                            result["refusals"]["soft_refusals"] += 1
+                            result["refusals"]["total_safety_refusals"] += 1
+                            _bump_agent_refusal(ag, "soft_refusals")
+                elif etype == "tool_response":
+                    in_turn = False
+                    if not has_direct_phase_tools and pid in result["tool_calls_by_phase"]:
+                        t_name = str(e.get("tool") or "unknown")
+                        cat = self._categorize_tool(t_name)
+                        if cat is not None:
+                            result["tool_calls_by_phase"][pid] += 1
+                            result["tool_categories_by_phase"][pid][cat] += 1
+                            resp_s = str(e.get("response") or "").strip()
+                            if resp_s.startswith(err_prefixes):
+                                result["tool_errors_by_phase"][pid] += 1
+
+            if "expert_query_" in tid:
+                expert_subruns += 1
+                repo_tools = [
+                    e
+                    for e in entries
+                    if e.get("type") == "tool_call" and e.get("tool") != "set_model_response"
+                ]
+                if not repo_tools:
+                    expert_zero_tools += 1
+
+            # Retroactive hard safety refusal vs non-refusal schema drop detection
+            if not has_direct_ref:
+                last_e = entries[-1]
+                last_ag = str(last_e.get("agent") or "")
+                if last_ag in (
+                    "AuditorAgent",
+                    "DeduplicationAgent",
+                    "AdversarialReviewerAgent",
+                    "ExploitCreationAgent",
+                ):
+                    used_set_resp = any(
+                        e.get("type") == "tool_call" and e.get("tool") == "set_model_response"
+                        for e in entries
+                    )
+                    if not used_set_resp:
+                        if last_e.get("type") in ("output", "thought"):
+                            last_out = str(last_e.get("content") or "").strip()
+                            is_json_out = last_out.startswith("{") or last_out.startswith("```")
+                            if not is_json_out:
+                                joined_low = " ".join(
+                                    str(e.get("content") or "") for e in entries
+                                ).lower()
+                                if any(m in joined_low for m in self.SAFETY_REFUSAL_MARKERS):
+                                    result["refusals"]["hard_safety_refusals"] += 1
+                                    result["refusals"]["total_safety_refusals"] += 1
+                                    _bump_agent_refusal(last_ag, "hard_safety_refusals")
+                                else:
+                                    result["refusals"]["schema_validation_drops"] += 1
+                                    _bump_agent_refusal(last_ag, "schema_validation_drops")
+                        elif last_e.get("type") == "tool_response" and not (
+                            tok.get("errors_grouped") or {}
+                        ):
+                            result["refusals"]["schema_validation_drops"] += 1
+                            _bump_agent_refusal(last_ag, "schema_validation_drops")
+
+        result["expert_cache_hits"] = max(0, result["expert_questions"] - expert_subruns)
+        result["expert_zero_tool_subruns"] = expert_zero_tools
+        result["expert_answered_from_history"] = result["expert_cache_hits"] + expert_zero_tools
+
+        # 5. PoC attempts & mechanical gate rejections from vulnerabilities.json
+        poc_attempts = 0
+        poc_gate_failures = 0
+        for v in vulns:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("id") or "")
+            poc_bundle = str(v.get("poc") or "")
+            for h in v.get("history") or []:
+                if not isinstance(h, dict):
+                    continue
+                h_pid = normalize_phase_id(h.get("phase_id") or h.get("phase_name"))
+                j_txt = str(
+                    h.get("justification") or (h.get("finding") or {}).get("justification") or ""
+                )
+                if not has_direct_ref and "Model soft refusal:" in j_txt:
+                    synth_tid = f"{h_pid}_{vid}"
+                    if synth_tid not in seen_soft_refusal_targets:
+                        seen_soft_refusal_targets.add(synth_tid)
+                        ag_map = {
+                            "poc_creation": "ExploitCreationAgent",
+                            "initial_review": "AdversarialReviewerAgent",
+                            "final_review": "AdversarialReviewerAgent",
+                        }
+                        ag_n = ag_map.get(h_pid, "UnknownAgent")
+                        result["refusals"]["soft_refusals"] += 1
+                        result["refusals"]["total_safety_refusals"] += 1
+                        _bump_agent_refusal(ag_n, "soft_refusals")
+                if h_pid == "poc_creation":
+                    if not j_txt.startswith("Skipped:"):
+                        poc_attempts += 1
+                    actual_ver = bool(
+                        h.get("poc_verified")
+                        or (isinstance(h.get("finding"), dict) and h["finding"].get("poc_verified"))
+                    )
+                    h_poc = str(h.get("poc") or (h.get("finding") or {}).get("poc") or poc_bundle)
+                    if "- **Mechanical Gate Rejected**: `True`" in h_poc:
+                        poc_gate_failures += 1
+                    elif vid and vid in claimed_poc_verified_ids and not actual_ver:
+                        poc_gate_failures += 1
+
+        if poc_attempts == 0 and rlog:
+            poc_attempts = sum(1 for tid in rlog if str(tid).startswith("poc_creation_"))
+        result["poc_attempts"] = poc_attempts
+        result["poc_gate_failures"] = poc_gate_failures
+
+        self._telemetry_cache[cache_key] = result
+        return result
+
     def generate_scorecard(
         self, eval_path: Path, output_dir: Path | None = None
     ) -> list[TierEvaluationSummary]:
@@ -179,6 +571,12 @@ class ScorecardGenerator:
                             cf.adjudicated_label = src.adjudicated_label
                         if not cf.maintainer_status and src.maintainer_status:
                             cf.maintainer_status = src.maintainer_status
+                        if not cf.expert_severity and src.expert_severity:
+                            cf.expert_severity = src.expert_severity
+                        if not cf.poc_demonstrates and src.poc_demonstrates:
+                            cf.poc_demonstrates = src.poc_demonstrates
+                        if not cf.cluster_error and src.cluster_error:
+                            cf.cluster_error = src.cluster_error
                         if not cf.notes and src.notes:
                             cf.notes = src.notes
             except Exception as e:
@@ -239,10 +637,12 @@ class ScorecardGenerator:
             canon_by_id=canon_by_id,
             occs_by_trial=occs_by_trial,
         )
+        refusal_summary = self._aggregate_refusal_summary(summaries)
 
         payload = {
             "inter_rater_stats": inter_rater.model_dump(),
             "cross_model_consistency": cross_model.model_dump() if cross_model else None,
+            "refusal_summary": refusal_summary,
             "tiers": [s.model_dump() for s in summaries],
         }
         (out_dir / "scorecard.json").write_text(
@@ -250,7 +650,7 @@ class ScorecardGenerator:
             encoding="utf-8",
         )
         (out_dir / "scorecard.md").write_text(
-            self._render_markdown(summaries, inter_rater, cross_model),
+            self._render_markdown(summaries, inter_rater, cross_model, refusal_summary),
             encoding="utf-8",
         )
         (out_dir / "scorecard_tables.tex").write_text(
@@ -263,6 +663,7 @@ class ScorecardGenerator:
             summaries=summaries,
             inter_rater=inter_rater,
             cross_model=cross_model,
+            refusal_summary=refusal_summary,
             manifest_path=manifest_path,
             pool_path=pool_path,
         )
@@ -284,12 +685,16 @@ class ScorecardGenerator:
     ) -> TierEvaluationSummary:
         all_tp_canons = [c for c in canon_by_id.values() if c.resolved_label == "TP"]
         total_pooled_tps = len(all_tp_canons)
+        has_any_expert_severity = any(
+            c.normalized_expert_severity is not None for c in all_tp_canons
+        )
         base_tier = tier_key.split("@")[0]
 
         open_counts: list[float] = []
         unique_rca_counts: list[float] = []
         redundant_dup_counts: list[float] = []
         tp_counts: list[float] = []
+        tp_med_plus_counts: list[float] = []
         fp_counts: list[float] = []
         unlabeled_counts: list[float] = []
         poc_counts: list[float] = []
@@ -298,6 +703,7 @@ class ScorecardGenerator:
         harness_limitation_counts: list[float] = []
         disproved_by_harness_counts: list[float] = []
         precisions: list[float] = []
+        precisions_med_plus: list[float] = []
         recalls: list[float] = []
         false_disproofs: list[float] = []
         fp_eliminations: list[float] = []
@@ -310,6 +716,26 @@ class ScorecardGenerator:
         run_pure_output_tokens: list[int] = []
         run_output_tokens: list[int] = []
         run_times: list[float] = []
+        run_llm_calls: list[float] = []
+        run_llm_by_agent: list[dict[str, int]] = []
+        run_tool_calls: list[float] = []
+        run_tool_errors: list[float] = []
+        run_tool_by_cat: list[dict[str, int]] = []
+        run_expert_questions: list[float] = []
+        run_expert_from_history: list[float] = []
+        run_expert_cache_hits: list[float] = []
+        run_poc_attempts: list[float] = []
+        run_poc_harness_cmds: list[float] = []
+        run_poc_harness_per_finding: list[float] = []
+        run_poc_gate_failures: list[float] = []
+        tier_refusals: dict[str, int | dict] = {
+            "total_safety_refusals": 0,
+            "hard_safety_refusals": 0,
+            "soft_refusals": 0,
+            "api_safety_blocks": 0,
+            "schema_validation_drops": 0,
+            "by_agent": {},
+        }
         rep_open_sets: list[set[str]] = []
         rep_poc_sets: list[set[str]] = []
         rep_tp_sets: list[set[str]] = []
@@ -324,6 +750,7 @@ class ScorecardGenerator:
             open_cids: set[str] = set()
             poc_cids: set[str] = set()
             tp_cids: set[str] = set()
+            tp_med_plus_cids: set[str] = set()
             fp_cids: set[str] = set()
             unlabeled_cids: set[str] = set()
             poc_tp_cids: set[str] = set()
@@ -346,6 +773,8 @@ class ScorecardGenerator:
                 label = cf.resolved_label if cf else None
                 if label == "TP":
                     tp_cids.add(cid)
+                    if cf and cf.normalized_expert_severity in ("Critical", "High", "Medium"):
+                        tp_med_plus_cids.add(cid)
                     if occ.poc_verified:
                         poc_tp_cids.add(cid)
                 elif label == "FP":
@@ -354,6 +783,7 @@ class ScorecardGenerator:
                     unlabeled_cids.add(cid)
 
             n_tp = len(tp_cids)
+            n_tp_med_plus = len(tp_med_plus_cids)
             n_fp = len(fp_cids)
             n_labeled_open = n_tp + n_fp
             open_findings = [
@@ -397,6 +827,7 @@ class ScorecardGenerator:
             unique_rca_counts.append(float(n_unique_rca))
             redundant_dup_counts.append(float(n_redundant_dup))
             tp_counts.append(float(n_tp))
+            tp_med_plus_counts.append(float(n_tp_med_plus))
             fp_counts.append(float(n_fp))
             unlabeled_counts.append(float(len(unlabeled_cids)))
             poc_counts.append(float(n_poc))
@@ -405,27 +836,71 @@ class ScorecardGenerator:
             harness_limitation_counts.append(float(n_harness_limitation))
             disproved_by_harness_counts.append(float(n_disproved_by_harness))
 
-            precisions.append(n_tp / n_labeled_open if n_labeled_open > 0 else 0.0)
+            if n_labeled_open > 0:
+                precisions.append(n_tp / n_labeled_open)
+                if has_any_expert_severity:
+                    precisions_med_plus.append(n_tp_med_plus / n_labeled_open)
             recalls.append(n_tp / total_pooled_tps if total_pooled_tps > 0 else 0.0)
-            poc_pass_rates.append(n_poc / n_open if n_open > 0 else 0.0)
+            if n_open > 0:
+                poc_pass_rates.append(n_poc / n_open)
 
             disc_tps = discovery_tps_by_run.get((base_tier, rep), set())
             if disc_tps:
                 disproved_tps = disc_tps - tp_cids
                 false_disproofs.append(len(disproved_tps) / len(disc_tps))
-            else:
-                false_disproofs.append(0.0)
 
             disc_fps = discovery_fps_by_run.get((base_tier, rep), set())
             if disc_fps:
                 eliminated_fps = disc_fps - fp_cids
                 fp_eliminations.append(len(eliminated_fps) / len(disc_fps))
-            else:
-                fp_eliminations.append(0.0)
 
             tho_tok, pure_out_tok = self._load_trial_thoughts_and_output_tokens(
                 eval_dir=eval_dir, tier_key=tier_key, trial=trial
             )
+            if "@" not in tier_key:
+                rep_dir = eval_dir / "trials" / tier_key / f"rep_{rep}"
+                telem = self._load_trial_telemetry(rep_dir=rep_dir, trial_findings=trial.findings)
+                if telem.get("has_telemetry"):
+                    run_llm_calls.append(float(telem["llm_calls_total"]))
+                    run_llm_by_agent.append(dict(telem["llm_calls_by_agent"]))
+                    run_tool_calls.append(float(telem["tool_calls_total"]))
+                    run_tool_errors.append(float(telem["tool_errors_total"]))
+                    run_tool_by_cat.append(dict(telem["tool_calls_by_category"]))
+                    run_expert_questions.append(float(telem["expert_questions"]))
+                    run_expert_from_history.append(float(telem["expert_answered_from_history"]))
+                    run_expert_cache_hits.append(float(telem["expert_cache_hits"]))
+                    p_att = int(telem["poc_attempts"])
+                    p_hcmds = int(telem["poc_harness_commands"])
+                    run_poc_attempts.append(float(p_att))
+                    run_poc_harness_cmds.append(float(p_hcmds))
+                    if p_att > 0:
+                        run_poc_harness_per_finding.append(p_hcmds / p_att)
+                    run_poc_gate_failures.append(float(telem["poc_gate_failures"]))
+                    t_ref = telem["refusals"]
+                    for rk in (
+                        "total_safety_refusals",
+                        "hard_safety_refusals",
+                        "soft_refusals",
+                        "api_safety_blocks",
+                        "schema_validation_drops",
+                    ):
+                        tier_refusals[rk] = int(tier_refusals.get(rk, 0)) + int(t_ref.get(rk, 0))
+                    ag_dst = tier_refusals["by_agent"]
+                    assert isinstance(ag_dst, dict)
+                    for ag_name, ag_counts in (t_ref.get("by_agent") or {}).items():
+                        b_ag = ag_dst.setdefault(
+                            ag_name,
+                            {
+                                "total_safety_refusals": 0,
+                                "hard_safety_refusals": 0,
+                                "soft_refusals": 0,
+                                "api_safety_blocks": 0,
+                                "schema_validation_drops": 0,
+                            },
+                        )
+                        for rk in b_ag:
+                            b_ag[rk] += int(ag_counts.get(rk, 0))
+
             rep_open_sets.append(open_cids)
             rep_poc_sets.append(poc_cids)
             rep_tp_sets.append(tp_cids)
@@ -589,6 +1064,37 @@ class ScorecardGenerator:
         )
         model_str = tier_trials[0].model if tier_trials else ""
 
+        def _mean_std(vals: list[float], ndigits: int = 2) -> tuple[float, float]:
+            if not vals:
+                return 0.0, 0.0
+            m_v = round(statistics.fmean(vals), ndigits)
+            s_v = round(statistics.stdev(vals) if len(vals) > 1 else 0.0, ndigits)
+            return m_v, s_v
+
+        llm_mean, llm_std = _mean_std(run_llm_calls)
+        tool_mean, tool_std = _mean_std(run_tool_calls)
+        tool_err_mean, tool_err_std = _mean_std(run_tool_errors)
+        exp_q_mean, exp_q_std = _mean_std(run_expert_questions)
+        exp_hist_mean, exp_hist_std = _mean_std(run_expert_from_history)
+        poc_att_mean, poc_att_std = _mean_std(run_poc_attempts)
+        poc_cmd_mean, poc_cmd_std = _mean_std(run_poc_harness_cmds)
+        poc_gate_mean, poc_gate_std = _mean_std(run_poc_gate_failures)
+
+        llm_by_agent_summary: dict[str, dict[str, float]] = {}
+        if run_llm_by_agent:
+            seen_agents = sorted({ag for d in run_llm_by_agent for ag in d})
+            for ag in seen_agents:
+                ag_vals = [float(d.get(ag, 0)) for d in run_llm_by_agent]
+                ag_m, ag_s = _mean_std(ag_vals)
+                llm_by_agent_summary[ag] = {"mean": ag_m, "std": ag_s}
+
+        tool_by_cat_summary: dict[str, dict[str, float]] = {}
+        if run_tool_by_cat:
+            for cat in self.TOOL_CATEGORIES:
+                cat_vals = [float(d.get(cat, 0)) for d in run_tool_by_cat]
+                c_m, c_s = _mean_std(cat_vals)
+                tool_by_cat_summary[cat] = {"mean": c_m, "std": c_s}
+
         return TierEvaluationSummary(
             ablation_tier=tier_key,
             tier_name=tier_name,
@@ -628,19 +1134,29 @@ class ScorecardGenerator:
             mean_disproved_by_harness=round(statistics.fmean(disproved_by_harness_counts), 2)
             if disproved_by_harness_counts
             else 0.0,
-            precision_mean=round(statistics.fmean(precisions), 4) if precisions else 0.0,
-            precision_std=round(statistics.stdev(precisions) if len(precisions) > 1 else 0.0, 4),
+            mean_true_positives_medium_plus=round(statistics.fmean(tp_med_plus_counts), 2)
+            if tp_med_plus_counts
+            else 0.0,
+            precision_mean=round(statistics.fmean(precisions), 4) if precisions else None,
+            precision_std=(
+                round(statistics.stdev(precisions) if len(precisions) > 1 else 0.0, 4)
+                if precisions
+                else None
+            ),
+            precision_medium_plus_mean=(
+                round(statistics.fmean(precisions_med_plus), 4) if precisions_med_plus else None
+            ),
             pooled_recall_mean=round(statistics.fmean(recalls), 4) if recalls else 0.0,
             pooled_recall_std=round(statistics.stdev(recalls) if len(recalls) > 1 else 0.0, 4),
-            false_disproof_rate_mean=round(statistics.fmean(false_disproofs), 4)
-            if false_disproofs
-            else 0.0,
-            fp_elimination_rate_mean=round(statistics.fmean(fp_eliminations), 4)
-            if fp_eliminations
-            else 0.0,
-            poc_pass_rate_mean=round(statistics.fmean(poc_pass_rates), 4)
-            if poc_pass_rates
-            else 0.0,
+            false_disproof_rate_mean=(
+                round(statistics.fmean(false_disproofs), 4) if false_disproofs else None
+            ),
+            fp_elimination_rate_mean=(
+                round(statistics.fmean(fp_eliminations), 4) if fp_eliminations else None
+            ),
+            poc_pass_rate_mean=(
+                round(statistics.fmean(poc_pass_rates), 4) if poc_pass_rates else None
+            ),
             mean_tokens_per_run=round(mean_tok, 1),
             mean_cached_tokens_per_run=round(statistics.fmean(run_cached_tokens), 1)
             if run_cached_tokens
@@ -661,12 +1177,91 @@ class ScorecardGenerator:
             mean_wall_clock_seconds=None
             if "@" in tier_key
             else (round(statistics.fmean(run_times), 2) if run_times else 0.0),
+            mean_llm_calls_per_run=llm_mean,
+            std_llm_calls_per_run=llm_std,
+            llm_calls_by_agent=llm_by_agent_summary,
+            mean_tool_calls_per_run=tool_mean,
+            std_tool_calls_per_run=tool_std,
+            mean_tool_errors_per_run=tool_err_mean,
+            std_tool_errors_per_run=tool_err_std,
+            tool_calls_by_category=tool_by_cat_summary,
+            mean_project_expert_questions=exp_q_mean,
+            std_project_expert_questions=exp_q_std,
+            mean_project_expert_answered_from_history=exp_hist_mean,
+            std_project_expert_answered_from_history=exp_hist_std,
+            mean_project_expert_cache_hits=(
+                round(statistics.fmean(run_expert_cache_hits), 2) if run_expert_cache_hits else 0.0
+            ),
+            mean_poc_attempts=poc_att_mean,
+            std_poc_attempts=poc_att_std,
+            mean_poc_harness_commands=poc_cmd_mean,
+            std_poc_harness_commands=poc_cmd_std,
+            mean_poc_harness_commands_per_finding=(
+                round(statistics.fmean(run_poc_harness_per_finding), 2)
+                if run_poc_harness_per_finding
+                else None
+            ),
+            std_poc_harness_commands_per_finding=(
+                round(
+                    statistics.stdev(run_poc_harness_per_finding)
+                    if len(run_poc_harness_per_finding) > 1
+                    else 0.0,
+                    2,
+                )
+                if run_poc_harness_per_finding
+                else None
+            ),
+            mean_poc_gate_failures=poc_gate_mean,
+            std_poc_gate_failures=poc_gate_std,
+            refusals_summary=tier_refusals if "@" not in tier_key else {},
             phase_funnel_summary=phase_funnel_summary,
             saturation_curve=saturation_curve,
             severity_distribution_mean=severity_distribution_mean,
             module_distribution_mean=module_distribution_mean,
             finding_detection_frequencies=finding_detection_frequencies,
         )
+
+    @staticmethod
+    def _aggregate_refusal_summary(summaries: list[TierEvaluationSummary]) -> dict:
+        """Aggregates safety refusals and schema drops across all primary (non-checkpoint) tiers."""
+        totals: dict[str, int | dict] = {
+            "total_safety_refusals": 0,
+            "hard_safety_refusals": 0,
+            "soft_refusals": 0,
+            "api_safety_blocks": 0,
+            "schema_validation_drops": 0,
+            "by_agent": {},
+            "by_tier": {},
+        }
+        keys = (
+            "total_safety_refusals",
+            "hard_safety_refusals",
+            "soft_refusals",
+            "api_safety_blocks",
+            "schema_validation_drops",
+        )
+        by_agent: dict[str, dict[str, int]] = {}
+        by_tier: dict[str, dict[str, int]] = {}
+        for s in summaries:
+            if "@" in s.ablation_tier or not s.refusals_summary:
+                continue
+            rs = s.refusals_summary
+            tier_entry = {k: int(rs.get(k, 0) or 0) for k in keys}
+            for k in keys:
+                totals[k] = int(totals[k]) + tier_entry[k]
+            if any(v > 0 for v in tier_entry.values()):
+                by_tier[s.ablation_tier] = tier_entry
+            ag_map = rs.get("by_agent")
+            if isinstance(ag_map, dict):
+                for ag, ag_counts in ag_map.items():
+                    if not isinstance(ag_counts, dict):
+                        continue
+                    b = by_agent.setdefault(ag, {k: 0 for k in keys})
+                    for k in keys:
+                        b[k] += int(ag_counts.get(k, 0) or 0)
+        totals["by_agent"] = by_agent
+        totals["by_tier"] = by_tier
+        return totals
 
     def _compute_cross_model_consistency(
         self,
@@ -751,6 +1346,7 @@ class ScorecardGenerator:
         summaries: list[TierEvaluationSummary],
         inter_rater: InterRaterStats,
         cross_model: CrossModelConsistencySummary | None = None,
+        refusal_summary: dict | None = None,
     ) -> str:
         lines = [
             "# Mjolnir Real-World Evaluation Scorecard",
@@ -759,15 +1355,27 @@ class ScorecardGenerator:
             "",
             f"- **Total Canonical Findings in Pool**: `{inter_rater.total_canonical_findings}`",
             f"- **Adjudicated Findings**: `{inter_rater.adjudicated_count}` "
-            f"(Confirmed TPs: `{inter_rater.confirmed_tp_count}`, Confirmed FPs: `{inter_rater.confirmed_fp_count}`, Unlabeled: `{inter_rater.unlabeled_count}`)",
-            f"- **Double-Reviewed Findings**: `{inter_rater.double_reviewed_count}` "
+            f"(Confirmed TPs: `{inter_rater.confirmed_tp_count}`, Medium+ TPs: `{inter_rater.confirmed_tp_medium_or_above_count}`, Confirmed FPs: `{inter_rater.confirmed_fp_count}`, Unlabeled: `{inter_rater.unlabeled_count}`)",
+            f"- **Double-Reviewed Findings**: `{inter_rater.double_reviewed_count}` (Single-Reviewed: `{inter_rater.single_reviewed_count}`) "
             f"| **Raw Agreement**: `{inter_rater.raw_agreement_rate:.1%}` | **Cohen's Kappa ($\\kappa$)**: `{inter_rater.cohens_kappa:.3f}`",
-            "",
-            "## 2. RQ1, RQ2 & RQ4: Quality, Redundancy & Token Cost Comparison",
-            "",
-            "| Tier | Mean Open | Unique RCAs | Redundancy | TPs | FPs | PoC Verified | Precision | Pooled Recall | False Disproof | FP Elim. | Tokens/Run | Tokens/TP | Time (s) |",
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
+        if refusal_summary is not None:
+            lines.append(
+                f"- **Safety Refusals Across Primary Runs**: `{refusal_summary.get('total_safety_refusals', 0)}` "
+                f"(Hard Plain-Text: `{refusal_summary.get('hard_safety_refusals', 0)}`, "
+                f"Structured Soft: `{refusal_summary.get('soft_refusals', 0)}`, "
+                f"API Safety Blocks: `{refusal_summary.get('api_safety_blocks', 0)}` "
+                f"| Non-Refusal Schema Drops: `{refusal_summary.get('schema_validation_drops', 0)}`)"
+            )
+        lines.extend(
+            [
+                "",
+                "## 2. RQ1, RQ2 & RQ4: Quality, Redundancy & Token Cost Comparison",
+                "",
+                "| Tier | Mean Open | Unique RCAs | Redundancy | TPs | FPs | PoC Verified | Precision | Pooled Recall | False Disproof | FP Elim. | Tokens/Run | Tokens/TP | Time (s) |",
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            ]
+        )
         for s in summaries:
             tok_tp_str = f"{s.tokens_per_tp:,.0f}" if s.tokens_per_tp is not None else "N/A"
             time_str = (
@@ -775,12 +1383,23 @@ class ScorecardGenerator:
                 if s.mean_wall_clock_seconds is not None
                 else "—"
             )
+            prec_str = f"{s.precision_mean:.1%}" if s.precision_mean is not None else "N/A"
+            fdisp_str = (
+                f"{s.false_disproof_rate_mean:.1%}"
+                if s.false_disproof_rate_mean is not None
+                else "N/A"
+            )
+            fpelim_str = (
+                f"{s.fp_elimination_rate_mean:.1%}"
+                if s.fp_elimination_rate_mean is not None
+                else "N/A"
+            )
             lines.append(
                 f"| **{s.tier_name}** | {s.mean_open_findings:.1f} | {s.mean_unique_root_causes:.1f} "
                 f"| {s.redundancy_ratio:.2f}x | {s.mean_true_positives:.1f} "
                 f"| {s.mean_false_positives:.1f} | {s.mean_poc_verified:.1f} "
-                f"| {s.precision_mean:.1%} | {s.pooled_recall_mean:.1%} "
-                f"| {s.false_disproof_rate_mean:.1%} | {s.fp_elimination_rate_mean:.1%} "
+                f"| {prec_str} | {s.pooled_recall_mean:.1%} "
+                f"| {fdisp_str} | {fpelim_str} "
                 f"| {s.mean_tokens_per_run:,.0f} | {tok_tp_str} | {time_str} |"
             )
 
@@ -866,7 +1485,7 @@ class ScorecardGenerator:
             lines.extend(
                 [
                     "",
-                    "## 6. RQ3 Deep Within-Model Stability: Cumulative Saturation Curve (Unbiased Expected Discover@k)",
+                    "## 6. RQ3 Deep Within-Model Stability: Cumulative Root-Cause Saturation Curve",
                     "",
                     "| Tier | k (Runs) | E[Unique Open(k)] | E[Unique PoC-Verified(k)] | E[Unique TP(k)] | E[Unique FP(k)] |",
                     "| :--- | :---: | :---: | :---: | :---: | :---: |",
@@ -913,10 +1532,15 @@ class ScorecardGenerator:
                 if s.mean_wall_clock_seconds is not None
                 else "\\textemdash{}"
             )
+            prec_tex = (
+                f"{s.precision_mean * 100:.1f}\\%"
+                if s.precision_mean is not None
+                else "\\textemdash{}"
+            )
             lines.append(
                 f"{safe_name} & {s.mean_open_findings:.1f} & {s.mean_unique_root_causes:.1f} & "
                 f"{s.redundancy_ratio:.2f}$\\times$ & {s.mean_true_positives:.1f} & "
-                f"{s.mean_false_positives:.1f} & {s.precision_mean * 100:.1f}\\% & "
+                f"{s.mean_false_positives:.1f} & {prec_tex} & "
                 f"{s.pooled_recall_mean * 100:.1f}\\% & {tok_m_str} & "
                 f"{tok_tp_str} & {time_str} \\\\"
             )
@@ -1012,6 +1636,7 @@ class ScorecardGenerator:
         summaries: list[TierEvaluationSummary],
         inter_rater: InterRaterStats,
         cross_model: CrossModelConsistencySummary | None,
+        refusal_summary: dict | None,
         manifest_path: Path,
         pool_path: Path,
     ) -> None:
@@ -1088,11 +1713,16 @@ class ScorecardGenerator:
                     if s.mean_wall_clock_seconds is not None
                     else "\\textemdash{}"
                 )
+                prec_rq1 = (
+                    f"{s.precision_mean * 100:.1f}\\%"
+                    if s.precision_mean is not None
+                    else "\\textemdash{}"
+                )
                 rq1_lines.append(
                     f"{safe_name} & {s.mean_open_findings:.1f} & {s.mean_unique_root_causes:.1f} & "
                     f"{s.redundancy_ratio:.2f}$\\times$ & {s.mean_poc_verified:.1f} & "
                     f"{s.mean_true_positives:.1f} & {s.mean_false_positives:.1f} & "
-                    f"{s.precision_mean * 100:.1f}\\% & {tok_m} & {time_str} \\\\"
+                    f"{prec_rq1} & {tok_m} & {time_str} \\\\"
                 )
             rq1_lines.extend(
                 [
@@ -1128,11 +1758,21 @@ class ScorecardGenerator:
             ]
             for s in rq2_tiers:
                 safe_name = self._paper_tier_label(s)
+                fpelim_tex = (
+                    f"{s.fp_elimination_rate_mean * 100:.1f}\\%"
+                    if s.fp_elimination_rate_mean is not None
+                    else "\\textemdash{}"
+                )
+                fdisp_tex = (
+                    f"{s.false_disproof_rate_mean * 100:.1f}\\%"
+                    if s.false_disproof_rate_mean is not None
+                    else "\\textemdash{}"
+                )
                 rq2_lines.append(
                     f"{safe_name} & {s.mean_open_findings:.1f} & {s.mean_unique_root_causes:.1f} & "
                     f"{s.redundancy_ratio:.2f}$\\times$ & {s.mean_poc_verified:.1f} & "
                     f"{s.mean_true_positives:.1f} & {s.mean_false_positives:.1f} & "
-                    f"{s.fp_elimination_rate_mean * 100:.1f}\\% & {s.false_disproof_rate_mean * 100:.1f}\\% \\\\"
+                    f"{fpelim_tex} & {fdisp_tex} \\\\"
                 )
             rq2_lines.extend(
                 [
@@ -1280,6 +1920,7 @@ class ScorecardGenerator:
             "blind_review_pool_sha256": pool_sha256,
             "blind_review_pool_stats": inter_rater.model_dump(),
             "cross_model_consistency": cross_model.model_dump() if cross_model else None,
+            "refusal_summary": refusal_summary,
             "pricing_schedules_usd_per_1m_tokens": pricing_used,
             "exported_tables": exported_table_names,
             "phase_token_breakdown": phase_token_breakdown,
@@ -1301,14 +1942,41 @@ class ScorecardGenerator:
                     "mean_harness_limitation": s.mean_harness_limitation,
                     "mean_disproved_by_harness": s.mean_disproved_by_harness,
                     "mean_true_positives": s.mean_true_positives,
+                    "mean_true_positives_medium_plus": s.mean_true_positives_medium_plus,
                     "mean_false_positives": s.mean_false_positives,
                     "precision_mean": s.precision_mean,
                     "precision_std": s.precision_std,
+                    "precision_medium_plus_mean": s.precision_medium_plus_mean,
                     "pooled_recall_mean": s.pooled_recall_mean,
                     "pooled_recall_std": s.pooled_recall_std,
+                    "false_disproof_rate_mean": s.false_disproof_rate_mean,
+                    "fp_elimination_rate_mean": s.fp_elimination_rate_mean,
+                    "poc_pass_rate_mean": s.poc_pass_rate_mean,
                     "consistency_jaccard_mean": s.consistency_jaccard_mean,
                     "consistency_jaccard_std": s.consistency_jaccard_std,
                     "phase_funnel_summary": s.phase_funnel_summary,
+                    "mean_llm_calls_per_run": s.mean_llm_calls_per_run,
+                    "std_llm_calls_per_run": s.std_llm_calls_per_run,
+                    "llm_calls_by_agent": s.llm_calls_by_agent,
+                    "mean_tool_calls_per_run": s.mean_tool_calls_per_run,
+                    "std_tool_calls_per_run": s.std_tool_calls_per_run,
+                    "mean_tool_errors_per_run": s.mean_tool_errors_per_run,
+                    "std_tool_errors_per_run": s.std_tool_errors_per_run,
+                    "tool_calls_by_category": s.tool_calls_by_category,
+                    "mean_project_expert_questions": s.mean_project_expert_questions,
+                    "std_project_expert_questions": s.std_project_expert_questions,
+                    "mean_project_expert_answered_from_history": s.mean_project_expert_answered_from_history,
+                    "std_project_expert_answered_from_history": s.std_project_expert_answered_from_history,
+                    "mean_project_expert_cache_hits": s.mean_project_expert_cache_hits,
+                    "mean_poc_attempts": s.mean_poc_attempts,
+                    "std_poc_attempts": s.std_poc_attempts,
+                    "mean_poc_harness_commands": s.mean_poc_harness_commands,
+                    "std_poc_harness_commands": s.std_poc_harness_commands,
+                    "mean_poc_harness_commands_per_finding": s.mean_poc_harness_commands_per_finding,
+                    "std_poc_harness_commands_per_finding": s.std_poc_harness_commands_per_finding,
+                    "mean_poc_gate_failures": s.mean_poc_gate_failures,
+                    "std_poc_gate_failures": s.std_poc_gate_failures,
+                    "refusals_summary": s.refusals_summary,
                     "mean_uncached_input_tokens": s.mean_uncached_input_tokens_per_run,
                     "mean_cached_tokens": s.mean_cached_tokens_per_run,
                     "mean_thoughts_tokens": s.mean_thoughts_tokens_per_run,
@@ -1680,7 +2348,7 @@ class ScorecardGenerator:
                 "    width=\\columnwidth,",
                 "    height=5.2cm,",
                 "    xlabel={Cumulative Repetitions ($k$)},",
-                "    ylabel={Expected Unique RCAs $E[\\text{Discover}(k)]$},",
+                "    ylabel={Expected unique root causes},",
                 "    xtick=data,",
                 "    ymin=0,",
                 "    ymajorgrids=true,",
@@ -1727,8 +2395,8 @@ class ScorecardGenerator:
             *([svg_meta_header] if svg_meta_header else []),
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" font-family="sans-serif">',
             '<rect width="100%" height="100%" fill="#ffffff"/>',
-            f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#111">Cumulative Discovery Saturation Curve (N={sat_tier.repetitions}, {repo_name})</text>',
-            f'<text x="18" y="{pad_t + plot_h / 2}" text-anchor="middle" font-size="12" fill="#333" transform="rotate(-90, 18, {pad_t + plot_h / 2})">Expected Unique RCAs E[Discover(k)]</text>',
+            f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#111">Cumulative Root-Cause Saturation Curve (N={sat_tier.repetitions}, {repo_name})</text>',
+            f'<text x="18" y="{pad_t + plot_h / 2}" text-anchor="middle" font-size="12" fill="#333" transform="rotate(-90, 18, {pad_t + plot_h / 2})">Expected unique root causes</text>',
         ]
         for y_val in range(0, int(max_y) + 1, step):
             y_px = pad_t + plot_h - (y_val / max_y) * plot_h
@@ -2104,8 +2772,14 @@ class ScorecardGenerator:
                     "thoughts": [],
                     "output": [],
                     "output_total": [],
+                    "llm_calls": [],
+                    "tool_calls": [],
+                    "tool_errors": [],
                 }
                 for pid, _ in phases
+            }
+            phase_cat_samples: dict[str, dict[str, list[float]]] = {
+                pid: {cat: [] for cat in self.TOOL_CATEGORIES} for pid, _ in phases
             }
             found_files = False
             if trials_dir.is_dir():
@@ -2120,6 +2794,7 @@ class ScorecardGenerator:
                         by_phase = tu_data.get("by_phase") or {}
                         if not isinstance(by_phase, dict) or not by_phase:
                             continue
+                        telem = self._load_trial_telemetry(rep_dir=rep_dir)
                         found_files = True
                         for pid, _ in phases:
                             b = by_phase.get(pid) or {}
@@ -2137,13 +2812,25 @@ class ScorecardGenerator:
                             phase_samples[pid]["thoughts"].append(tho)
                             phase_samples[pid]["output"].append(out)
                             phase_samples[pid]["output_total"].append(tot_out)
+                            phase_samples[pid]["llm_calls"].append(
+                                float((telem["llm_calls_by_phase"] or {}).get(pid, 0))
+                            )
+                            phase_samples[pid]["tool_calls"].append(
+                                float((telem["tool_calls_by_phase"] or {}).get(pid, 0))
+                            )
+                            phase_samples[pid]["tool_errors"].append(
+                                float((telem["tool_errors_by_phase"] or {}).get(pid, 0))
+                            )
+                            p_cats = (telem["tool_categories_by_phase"] or {}).get(pid) or {}
+                            for cat in self.TOOL_CATEGORIES:
+                                phase_cat_samples[pid][cat].append(float(p_cats.get(cat, 0)))
                     except Exception:
                         continue
 
             if not found_files:
                 continue
 
-            phase_stats: dict[str, dict[str, float | None]] = {}
+            phase_stats: dict[str, dict] = {}
             n_reps = 0
             for pid, _ in phases:
                 s_map = phase_samples[pid]
@@ -2156,9 +2843,18 @@ class ScorecardGenerator:
                 tot_out_mean = (
                     statistics.fmean(s_map["output_total"]) if s_map["output_total"] else 0.0
                 )
+                llm_c_mean = statistics.fmean(s_map["llm_calls"]) if s_map["llm_calls"] else 0.0
+                tool_c_mean = statistics.fmean(s_map["tool_calls"]) if s_map["tool_calls"] else 0.0
+                tool_e_mean = (
+                    statistics.fmean(s_map["tool_errors"]) if s_map["tool_errors"] else 0.0
+                )
                 est_cost = self._estimate_cost_usd(
                     unc_mean, cac_mean, tot_out_mean, model=model_label
                 )
+                cat_means = {
+                    cat: round(statistics.fmean(vals), 2) if vals else 0.0
+                    for cat, vals in phase_cat_samples[pid].items()
+                }
                 phase_stats[pid] = {
                     "uncached_mean": round(unc_mean, 1),
                     "uncached_std": round(
@@ -2194,6 +2890,28 @@ class ScorecardGenerator:
                         else 0.0,
                         1,
                     ),
+                    "llm_calls_mean": round(llm_c_mean, 2),
+                    "llm_calls_std": round(
+                        statistics.stdev(s_map["llm_calls"])
+                        if len(s_map["llm_calls"]) >= 2
+                        else 0.0,
+                        2,
+                    ),
+                    "tool_calls_mean": round(tool_c_mean, 2),
+                    "tool_calls_std": round(
+                        statistics.stdev(s_map["tool_calls"])
+                        if len(s_map["tool_calls"]) >= 2
+                        else 0.0,
+                        2,
+                    ),
+                    "tool_errors_mean": round(tool_e_mean, 2),
+                    "tool_errors_std": round(
+                        statistics.stdev(s_map["tool_errors"])
+                        if len(s_map["tool_errors"]) >= 2
+                        else 0.0,
+                        2,
+                    ),
+                    "tool_calls_by_category_mean": cat_means,
                     "estimated_cost_usd": round(est_cost, 4) if est_cost is not None else None,
                 }
             model_series.append(

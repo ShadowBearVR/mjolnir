@@ -69,9 +69,9 @@ CMD_EXIT_CODE=$?
 set -e
 echo "=================================================================="
 if [[ $CMD_EXIT_CODE -ne 0 ]]; then
-  echo "[Mjolnir PoC] VERDICT: VULNERABILITY REPRODUCED (exit code: $CMD_EXIT_CODE)"
+  echo "[Mjolnir PoC] COMMAND FAILED (exit code $CMD_EXIT_CODE)"
 else
-  echo "[Mjolnir PoC] VERDICT: COMMAND RETURNED 0"
+  echo "[Mjolnir PoC] COMMAND RETURNED 0"
 fi
 echo "=================================================================="
 exit $CMD_EXIT_CODE

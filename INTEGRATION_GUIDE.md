@@ -102,7 +102,7 @@ In your repository's `flake.nix`, add Mjolnir as an input and use `mjolnir.lib.d
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     mjolnir = {
-      url = "github:chipsalliance/mjolnir";
+      url = "github:<org>/mjolnir";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

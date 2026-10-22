@@ -107,6 +107,18 @@ class CanonicalFinding(BaseModel):
     adjudicated_label: str | None = Field(
         default=None, description="Consensus verdict after adjudication: 'TP' or 'FP'"
     )
+    expert_severity: str | None = Field(
+        default=None,
+        description="Expert severity for confirmed TPs: 'Critical', 'High', 'Medium', 'Low', or 'Informational'",
+    )
+    poc_demonstrates: str | None = Field(
+        default=None,
+        description="Whether a verified PoC genuinely exercises the flaw: 'yes' or 'no'",
+    )
+    cluster_error: str | None = Field(
+        default=None,
+        description="Pooler clustering audit flag: 'none', 'split', or 'merge'",
+    )
     maintainer_status: str = Field(
         default="",
         description="Upstream disclosure tracking: '', 'reported', 'confirmed', or 'fixed'",
@@ -124,6 +136,46 @@ class CanonicalFinding(BaseModel):
             return "FP"
         return None
 
+    @staticmethod
+    def _normalize_severity(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        mapping = {
+            "critical": "Critical",
+            "crit": "Critical",
+            "high": "High",
+            "medium": "Medium",
+            "med": "Medium",
+            "low": "Low",
+            "informational": "Informational",
+            "info": "Informational",
+        }
+        return mapping.get(raw.strip().lower())
+
+    @staticmethod
+    def _normalize_yes_no(raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        s = str(raw).strip().lower()
+        if s in ("yes", "y", "true", "1"):
+            return "yes"
+        if s in ("no", "n", "false", "0"):
+            return "no"
+        return None
+
+    @staticmethod
+    def _normalize_cluster_error(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        s = raw.strip().lower()
+        if s in ("none", "ok", "valid"):
+            return "none"
+        if s in ("split", "undermerged", "over_split", "oversplit"):
+            return "split"
+        if s in ("merge", "overmerged", "false_merge"):
+            return "merge"
+        return None
+
     @property
     def resolved_label(self) -> str | None:
         adj = self._normalize_label(self.adjudicated_label)
@@ -133,7 +185,19 @@ class CanonicalFinding(BaseModel):
         r2 = self._normalize_label(self.reviewer_2_label)
         if r1 and r2:
             return r1 if r1 == r2 else None
-        return r1 or r2
+        return None
+
+    @property
+    def normalized_expert_severity(self) -> str | None:
+        return self._normalize_severity(self.expert_severity)
+
+    @property
+    def normalized_poc_demonstrates(self) -> str | None:
+        return self._normalize_yes_no(self.poc_demonstrates)
+
+    @property
+    def normalized_cluster_error(self) -> str | None:
+        return self._normalize_cluster_error(self.cluster_error)
 
 
 class FindingPoolMapping(BaseModel):
@@ -148,13 +212,18 @@ class InterRaterStats(BaseModel):
 
     total_canonical_findings: int = 0
     double_reviewed_count: int = 0
+    single_reviewed_count: int = 0
     adjudicated_count: int = 0
     confirmed_tp_count: int = 0
+    confirmed_tp_medium_or_above_count: int = 0
     confirmed_fp_count: int = 0
     disputed_unadjudicated_count: int = 0
     unlabeled_count: int = 0
     raw_agreement_rate: float = 0.0
     cohens_kappa: float = 0.0
+    expert_severity_counts: dict[str, int] = Field(default_factory=dict)
+    poc_demonstrates_counts: dict[str, int] = Field(default_factory=dict)
+    cluster_error_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class CrossModelConsistencySummary(BaseModel):
@@ -202,13 +271,15 @@ class TierEvaluationSummary(BaseModel):
     mean_open_unverified: float = 0.0
     mean_harness_limitation: float = 0.0
     mean_disproved_by_harness: float = 0.0
-    precision_mean: float = 0.0
-    precision_std: float = 0.0
+    mean_true_positives_medium_plus: float = 0.0
+    precision_mean: float | None = None
+    precision_std: float | None = None
+    precision_medium_plus_mean: float | None = None
     pooled_recall_mean: float = 0.0
     pooled_recall_std: float = 0.0
-    false_disproof_rate_mean: float = 0.0
-    fp_elimination_rate_mean: float = 0.0
-    poc_pass_rate_mean: float = 0.0
+    false_disproof_rate_mean: float | None = None
+    fp_elimination_rate_mean: float | None = None
+    poc_pass_rate_mean: float | None = None
     mean_tokens_per_run: float = 0.0
     mean_cached_tokens_per_run: float = 0.0
     mean_uncached_input_tokens_per_run: float = 0.0
@@ -217,6 +288,28 @@ class TierEvaluationSummary(BaseModel):
     mean_output_tokens_per_run: float = 0.0
     tokens_per_tp: float | None = None
     mean_wall_clock_seconds: float | None = None
+    mean_llm_calls_per_run: float = 0.0
+    std_llm_calls_per_run: float = 0.0
+    llm_calls_by_agent: dict[str, dict[str, float]] = Field(default_factory=dict)
+    mean_tool_calls_per_run: float = 0.0
+    std_tool_calls_per_run: float = 0.0
+    mean_tool_errors_per_run: float = 0.0
+    std_tool_errors_per_run: float = 0.0
+    tool_calls_by_category: dict[str, dict[str, float]] = Field(default_factory=dict)
+    mean_project_expert_questions: float = 0.0
+    std_project_expert_questions: float = 0.0
+    mean_project_expert_answered_from_history: float = 0.0
+    std_project_expert_answered_from_history: float = 0.0
+    mean_project_expert_cache_hits: float = 0.0
+    mean_poc_attempts: float = 0.0
+    std_poc_attempts: float = 0.0
+    mean_poc_harness_commands: float = 0.0
+    std_poc_harness_commands: float = 0.0
+    mean_poc_harness_commands_per_finding: float | None = None
+    std_poc_harness_commands_per_finding: float | None = None
+    mean_poc_gate_failures: float = 0.0
+    std_poc_gate_failures: float = 0.0
+    refusals_summary: dict[str, int | dict[str, dict[str, int]]] = Field(default_factory=dict)
     phase_funnel_summary: dict[str, dict[str, float]] = Field(default_factory=dict)
     saturation_curve: dict[int, dict[str, float]] = Field(default_factory=dict)
     severity_distribution_mean: dict[str, float] = Field(default_factory=dict)

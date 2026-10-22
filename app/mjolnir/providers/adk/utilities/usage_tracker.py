@@ -36,7 +36,17 @@ class UsageTracker:
         self.usage_by_phase = {}
         self._current_phase = "project_exploration"
         self.error_counts = {}
+        self.refusal_counts = {
+            "total_safety_refusals": 0,
+            "hard_safety_refusals": 0,
+            "soft_refusals": 0,
+            "api_safety_blocks": 0,
+            "schema_validation_drops": 0,
+            "by_agent": {},
+            "by_phase": {},
+        }
         self.total_usage = {
+            "llm_calls": 0,
             "prompt_tokens": 0,
             "uncached_tokens": 0,
             "cache_tokens": 0,
@@ -48,6 +58,7 @@ class UsageTracker:
             "total_errors": 0,
         }
         self.tool_usage_by_agent = {}
+        self.tool_usage_by_phase = {}
         self.tool_usage_by_tool = {}
         self.tool_calls_per_item = {}
         self.total_tool_usage = {
@@ -63,8 +74,9 @@ class UsageTracker:
         success: bool,
         agent_name: str = "UnknownAgent",
         item_key: str | None = None,
+        phase_id: str | None = None,
     ):
-        """Records a tool invocation, success, failure, and per-item stat."""
+        """Records a tool invocation, success, failure, and per-item/per-phase stat."""
 
         self.total_tool_usage["total_calls"] += 1
         if success:
@@ -96,6 +108,22 @@ class UsageTracker:
         else:
             self.tool_usage_by_agent[agent_name][tool_name]["failures"] += 1
 
+        # Per-phase breakdown
+        eff_phase = phase_id or self._current_phase or "discovery"
+        if eff_phase not in self.tool_usage_by_phase:
+            self.tool_usage_by_phase[eff_phase] = {}
+        if tool_name not in self.tool_usage_by_phase[eff_phase]:
+            self.tool_usage_by_phase[eff_phase][tool_name] = {
+                "calls": 0,
+                "successes": 0,
+                "failures": 0,
+            }
+        self.tool_usage_by_phase[eff_phase][tool_name]["calls"] += 1
+        if success:
+            self.tool_usage_by_phase[eff_phase][tool_name]["successes"] += 1
+        else:
+            self.tool_usage_by_phase[eff_phase][tool_name]["failures"] += 1
+
         # Per-item breakdown
         if item_key:
             if agent_name not in self.tool_calls_per_item:
@@ -103,6 +131,40 @@ class UsageTracker:
             self.tool_calls_per_item[agent_name][item_key] = (
                 self.tool_calls_per_item[agent_name].get(item_key, 0) + 1
             )
+
+    def track_refusal(
+        self,
+        kind: str,
+        agent_name: str = "UnknownAgent",
+        phase_id: str | None = None,
+    ):
+        """Records a safety refusal or non-refusal schema validation drop."""
+        if kind not in (
+            "hard_safety_refusals",
+            "soft_refusals",
+            "api_safety_blocks",
+            "schema_validation_drops",
+        ):
+            return
+        self.refusal_counts[kind] += 1
+        is_safety = kind != "schema_validation_drops"
+        if is_safety:
+            self.refusal_counts["total_safety_refusals"] += 1
+        eff_phase = phase_id or self._current_phase or "discovery"
+        for map_key, bucket_id in (("by_agent", agent_name), ("by_phase", eff_phase)):
+            b = self.refusal_counts[map_key].setdefault(
+                bucket_id,
+                {
+                    "total_safety_refusals": 0,
+                    "hard_safety_refusals": 0,
+                    "soft_refusals": 0,
+                    "api_safety_blocks": 0,
+                    "schema_validation_drops": 0,
+                },
+            )
+            b[kind] += 1
+            if is_safety:
+                b["total_safety_refusals"] += 1
 
     def track_error(self, e: Exception, agent_name: str = "system"):
         """Records an encountered error to surface in the final summary."""
@@ -120,6 +182,14 @@ class UsageTracker:
         self.total_usage["total_errors"] += 1
         self.error_counts[err_key] = self.error_counts.get(err_key, 0) + 1
 
+        upper_err = err_key.upper()
+        if (
+            any(w in upper_err for w in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"))
+            and "HARDSAFETYREFUSAL" not in upper_err
+            and "SOFTREFUSAL" not in upper_err
+        ):
+            self.track_refusal("api_safety_blocks", agent_name=agent_name)
+
         if agent_name not in self.usage_by_agent:
             self.usage_by_agent[agent_name] = self._get_empty_agent_stats()
 
@@ -128,6 +198,7 @@ class UsageTracker:
     def _get_empty_agent_stats(self):
         return {
             "model": "unknown",
+            "llm_calls": 0,
             "prompt_tokens": 0,
             "uncached_tokens": 0,
             "cache_tokens": 0,
@@ -247,6 +318,7 @@ class UsageTracker:
                     success=not is_error,
                     agent_name=agent_name,
                     item_key=item_key,
+                    phase_id=self._resolve_phase_id(ev, agent_name, item_key),
                 )
                 log_entries.append(
                     {
@@ -338,6 +410,7 @@ class UsageTracker:
             self.usage_by_phase[phase_id],
             self.total_usage,
         ):
+            bucket["llm_calls"] += 1
             bucket["prompt_tokens"] += p_tokens
             bucket["uncached_tokens"] += u_tokens
             bucket["cache_tokens"] += c_tokens
@@ -395,6 +468,7 @@ class UsageTracker:
         token_data = {
             "total": self.total_usage,
             "errors_grouped": self.error_counts,
+            "refusals": self.refusal_counts,
             "by_agent": self.usage_by_agent,
             "by_phase": self.usage_by_phase,
         }
@@ -431,6 +505,15 @@ class UsageTracker:
                 rate = f"{(f_count / c * 100):.2f}%" if c > 0 else "0.00%"
                 by_agent_formatted[a_name]["tools"][t_name] = {**stats, "failure_rate": rate}
 
+        by_phase_formatted = {}
+        for p_id, tools in self.tool_usage_by_phase.items():
+            by_phase_formatted[p_id] = {}
+            for t_name, stats in tools.items():
+                c = stats["calls"]
+                f_count = stats["failures"]
+                rate = f"{(f_count / c * 100):.2f}%" if c > 0 else "0.00%"
+                by_phase_formatted[p_id][t_name] = {**stats, "failure_rate": rate}
+
         overall_stats = self._calc_stats(all_item_counts)
 
         tool_data = {
@@ -441,6 +524,7 @@ class UsageTracker:
             },
             "by_tool": by_tool_formatted,
             "by_agent": by_agent_formatted,
+            "by_phase": by_phase_formatted,
             "per_item": self.tool_calls_per_item,
         }
         tool_path = Path(run_dir) / "tool_usage.json"

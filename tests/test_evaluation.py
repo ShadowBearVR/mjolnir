@@ -862,6 +862,277 @@ class TestEvaluationHarness(unittest.TestCase):
             self.assertEqual(stab_summaries[0].repetitions, 3)
             self.assertEqual(stab_summaries[0].consistent_tps_all_reps, 1)
 
+    def test_harness_fixes_h1_to_h8_and_refusal_tracking(self) -> None:
+        from types import SimpleNamespace
+        from providers.adk.utilities.async_runner import is_safety_refusal_text
+        from providers.adk.utilities.usage_tracker import UsageTracker
+        from utilities.worktree_sandbox import REPRODUCE_SCRIPT_TEMPLATE
+
+        # H8: Neutral reproducer exit message
+        self.assertNotIn("VULNERABILITY REPRODUCED", REPRODUCE_SCRIPT_TEMPLATE)
+        self.assertIn("COMMAND FAILED (exit code", REPRODUCE_SCRIPT_TEMPLATE)
+
+        # H4 & H5: Dual-expert resolution + expert_severity / poc_demonstrates / cluster_error
+        base_cf_kwargs = {
+            "project_name": "Caliptra",
+            "repo_name": "caliptra-sw",
+            "pinned_rev": "262470b",
+            "location": "Line 10",
+            "title": "Test finding",
+            "description": "Test description",
+        }
+        single_labeled = CanonicalFinding(
+            canonical_id="CANON-001",
+            file="a.rs",
+            reviewer_1_label="TP",
+            reviewer_2_label="",
+            **base_cf_kwargs,
+        )
+        self.assertIsNone(single_labeled.resolved_label)
+
+        disputed = CanonicalFinding(
+            canonical_id="CANON-002",
+            file="b.rs",
+            reviewer_1_label="TP",
+            reviewer_2_label="FP",
+            **base_cf_kwargs,
+        )
+        self.assertIsNone(disputed.resolved_label)
+
+        agreed_med_tp = CanonicalFinding(
+            canonical_id="CANON-003",
+            file="c.rs",
+            reviewer_1_label="TP",
+            reviewer_2_label="TP",
+            expert_severity="high",
+            poc_demonstrates="yes",
+            cluster_error="none",
+            **base_cf_kwargs,
+        )
+        agreed_low_tp = CanonicalFinding(
+            canonical_id="CANON-004",
+            file="d.rs",
+            adjudicated_label="TP",
+            expert_severity="Low",
+            poc_demonstrates="no",
+            cluster_error="split",
+            **base_cf_kwargs,
+        )
+        self.assertEqual(agreed_med_tp.resolved_label, "TP")
+        self.assertEqual(agreed_med_tp.normalized_expert_severity, "High")
+        ir = compute_inter_rater_stats([single_labeled, disputed, agreed_med_tp, agreed_low_tp])
+        self.assertEqual(ir.single_reviewed_count, 1)
+        self.assertEqual(ir.disputed_unadjudicated_count, 1)
+        self.assertEqual(ir.confirmed_tp_count, 2)
+        self.assertEqual(ir.confirmed_tp_medium_or_above_count, 1)
+        self.assertEqual(ir.expert_severity_counts["High"], 1)
+        self.assertEqual(ir.expert_severity_counts["Low"], 1)
+        self.assertEqual(ir.poc_demonstrates_counts, {"yes": 1, "no": 1})
+        self.assertEqual(ir.cluster_error_counts, {"none": 1, "split": 1, "merge": 0})
+
+        # H1 + Refusal tracking in UsageTracker & safety refusal classifier
+        self.assertTrue(
+            is_safety_refusal_text(
+                "I cannot fulfill this request. I am unable to generate functional exploit payloads."
+            )
+        )
+        self.assertFalse(
+            is_safety_refusal_text(
+                "After reviewing rom/src/i3c.rs, all bounds checks hold and no vulnerabilities were found."
+            )
+        )
+
+        tracker = UsageTracker()
+        tracker.track_event(
+            SimpleNamespace(
+                author="ExploitCreationAgent",
+                branch="ExploitCreationAgent@poc_creation_v1",
+                node_name="poc_creation_phase",
+                model_version="gemini-3.8-flash",
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=500,
+                    candidates_token_count=100,
+                    cached_content_token_count=200,
+                    thoughts_token_count=50,
+                    total_token_count=650,
+                ),
+            )
+        )
+        tracker.track_tool_call(
+            "run_harness_command",
+            True,
+            agent_name="ExploitCreationAgent",
+            phase_id="poc_creation",
+        )
+        tracker.track_refusal(
+            "hard_safety_refusals", agent_name="ExploitCreationAgent", phase_id="poc_creation"
+        )
+        tracker.track_refusal(
+            "schema_validation_drops", agent_name="AuditorAgent", phase_id="discovery"
+        )
+        tracker.track_error(
+            RuntimeError("SAFETY: The prompt is blocked due to safety"),
+            agent_name="AdversarialReviewerAgent",
+        )
+        self.assertEqual(tracker.total_usage["llm_calls"], 1)
+        self.assertEqual(tracker.usage_by_agent["ExploitCreationAgent"]["llm_calls"], 1)
+        self.assertEqual(
+            tracker.tool_usage_by_phase["poc_creation"]["run_harness_command"]["calls"], 1
+        )
+        self.assertEqual(tracker.refusal_counts["total_safety_refusals"], 2)
+        self.assertEqual(tracker.refusal_counts["hard_safety_refusals"], 1)
+        self.assertEqual(tracker.refusal_counts["api_safety_blocks"], 1)
+        self.assertEqual(tracker.refusal_counts["schema_validation_drops"], 1)
+
+        # H1 + H3 + H6 retroactive telemetry, None zero-denominator precision, and saturation labels
+        with tempfile.TemporaryDirectory() as tmp:
+            eval_dir = Path(tmp) / "caliptra-dpe" / "pinned"
+            rep_dirs = [eval_dir / "trials" / "full" / f"rep_{r}" for r in range(1, 6)]
+            trials_list = []
+            for r_idx, r_dir in enumerate(rep_dirs, start=1):
+                run_sub = r_dir / "run_001"
+                run_sub.mkdir(parents=True)
+                (run_sub / "token_usage.json").write_text(
+                    json.dumps(
+                        {
+                            "total": {
+                                "total_tokens": 1000,
+                                "uncached_tokens": 600,
+                                "cache_tokens": 200,
+                                "total_output_tokens": 200,
+                            },
+                            "by_phase": {
+                                "discovery": {
+                                    "uncached_tokens": 600,
+                                    "cache_tokens": 200,
+                                    "total_output_tokens": 200,
+                                }
+                            },
+                            "errors_grouped": ({"SAFETY: blocked": 1} if r_idx == 1 else {}),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run_sub / "tool_usage.json").write_text(
+                    json.dumps(
+                        {
+                            "by_tool": {
+                                "read_file": {"calls": 10, "failures": 0},
+                                "ask_project_expert": {"calls": 3, "failures": 0},
+                                "run_harness_command": {"calls": 4, "failures": 1},
+                                "set_model_response": {"calls": 2, "failures": 0},
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run_sub / "reasoning_log.json").write_text(
+                    json.dumps(
+                        {
+                            "expert_query_1": [
+                                {
+                                    "type": "thought",
+                                    "agent": "ProjectExpertAgent",
+                                    "content": "Recall",
+                                },
+                                {
+                                    "type": "tool_call",
+                                    "agent": "ProjectExpertAgent",
+                                    "tool": "set_model_response",
+                                    "args": {"answer": "ok"},
+                                },
+                            ],
+                            "poc_creation_v1": (
+                                [
+                                    {
+                                        "type": "output",
+                                        "agent": "ExploitCreationAgent",
+                                        "content": "I cannot fulfill this request. I am unable to generate functional exploit payloads.",
+                                    }
+                                ]
+                                if r_idx == 1
+                                else [
+                                    {
+                                        "type": "tool_call",
+                                        "agent": "ExploitCreationAgent",
+                                        "tool": "set_model_response",
+                                        "args": {"poc_verified": True},
+                                    }
+                                ]
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                f_item = {
+                    "id": "v1",
+                    "file": "dpe/src/cmd.rs",
+                    "location": "Line 10",
+                    "cwe": "CWE-20",
+                    "severity": "High",
+                    "status": "Open",
+                    "title": "Unchecked input",
+                    "description": "Unchecked input.",
+                    "poc_verified": False,
+                    "history": [
+                        {"phase_id": "poc_creation", "status": "Open", "poc_verified": False}
+                    ],
+                }
+                (run_sub / "vulnerabilities.json").write_text(
+                    json.dumps([f_item]), encoding="utf-8"
+                )
+                trials_list.append(
+                    TrialRunRecord(
+                        project_name="DPE",
+                        repo_name="caliptra-dpe",
+                        pinned_rev="7c210f1",
+                        target_dir="dpe/src",
+                        ablation_tier="full",
+                        tier_name="Mjolnir Full",
+                        model="gemini-3.8-flash",
+                        repetition=r_idx,
+                        wall_clock_seconds=12.0,
+                        total_tokens=1000,
+                        cached_tokens=200,
+                        uncached_input_tokens=600,
+                        output_tokens=200,
+                        open_findings_count=1,
+                        poc_verified_count=0,
+                        findings=[f_item],
+                    )
+                )
+            (eval_dir / "trials_manifest.json").write_text(
+                json.dumps([t.model_dump() for t in trials_list], indent=2), encoding="utf-8"
+            )
+            summaries = ScorecardGenerator().generate_scorecard(eval_dir)
+            s_full = summaries[0]
+            # H3: Pool has 0 human labels -> precision_mean must be None (not 0.0)
+            self.assertIsNone(s_full.precision_mean)
+            self.assertIsNone(s_full.precision_std)
+            # H1: Tool calls exclude set_model_response (10 + 3 + 4 = 17), 1 tool error, expert 2 cache + 1 zero-tool = 3 from history
+            self.assertEqual(s_full.mean_tool_calls_per_run, 17.0)
+            self.assertEqual(s_full.mean_tool_errors_per_run, 1.0)
+            self.assertEqual(s_full.mean_project_expert_questions, 3.0)
+            self.assertEqual(s_full.mean_project_expert_answered_from_history, 3.0)
+            # Gate rejected poc_verified=True in reps 2..5 (4/5 = 0.8 mean gate failures)
+            self.assertEqual(s_full.mean_poc_gate_failures, 0.8)
+            # Refusal summary: 1 hard refusal + 1 API safety block = 2 total safety refusals
+            sc_json = json.loads((eval_dir / "scorecard.json").read_text(encoding="utf-8"))
+            self.assertEqual(sc_json["refusal_summary"]["total_safety_refusals"], 2)
+            self.assertEqual(sc_json["refusal_summary"]["hard_safety_refusals"], 1)
+            self.assertEqual(sc_json["refusal_summary"]["api_safety_blocks"], 1)
+            # H6: Saturation plot uses "Expected unique root causes" without "Discover"
+            sat_tex = (eval_dir / "plots" / "fig_rq3_saturation_curve.tex").read_text(
+                encoding="utf-8"
+            )
+            sat_svg = (eval_dir / "plots" / "fig_rq3_saturation_curve.svg").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Expected unique root causes", sat_tex)
+            self.assertNotIn("Discover", sat_tex)
+            self.assertIn("Expected unique root causes", sat_svg)
+            self.assertNotIn("Discover", sat_svg)
+
 
 if __name__ == "__main__":
     unittest.main()

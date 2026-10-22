@@ -387,8 +387,19 @@ def keyword_tokens(text: str) -> set[str]:
 
 
 def compute_inter_rater_stats(pool: list[CanonicalFinding]) -> InterRaterStats:
-    """Computes raw agreement and Cohen's kappa across double-reviewed canonical findings."""
-    stats = InterRaterStats(total_canonical_findings=len(pool))
+    """Computes raw agreement, Cohen's kappa, and expert-pass summary counts across canonical findings."""
+    stats = InterRaterStats(
+        total_canonical_findings=len(pool),
+        expert_severity_counts={
+            "Critical": 0,
+            "High": 0,
+            "Medium": 0,
+            "Low": 0,
+            "Informational": 0,
+        },
+        poc_demonstrates_counts={"yes": 0, "no": 0},
+        cluster_error_counts={"none": 0, "split": 0, "merge": 0},
+    )
     if not pool:
         return stats
 
@@ -402,17 +413,36 @@ def compute_inter_rater_stats(pool: list[CanonicalFinding]) -> InterRaterStats:
         if resolved == "TP":
             stats.confirmed_tp_count += 1
             stats.adjudicated_count += 1
+            exp_sev = cf.normalized_expert_severity
+            if exp_sev:
+                stats.expert_severity_counts[exp_sev] = (
+                    stats.expert_severity_counts.get(exp_sev, 0) + 1
+                )
+                if exp_sev in ("Critical", "High", "Medium"):
+                    stats.confirmed_tp_medium_or_above_count += 1
         elif resolved == "FP":
             stats.confirmed_fp_count += 1
             stats.adjudicated_count += 1
         else:
             stats.unlabeled_count += 1
 
+        poc_dem = cf.normalized_poc_demonstrates
+        if poc_dem:
+            stats.poc_demonstrates_counts[poc_dem] = (
+                stats.poc_demonstrates_counts.get(poc_dem, 0) + 1
+            )
+
+        cl_err = cf.normalized_cluster_error
+        if cl_err:
+            stats.cluster_error_counts[cl_err] = stats.cluster_error_counts.get(cl_err, 0) + 1
+
         if r1 in ("TP", "FP") and r2 in ("TP", "FP"):
             r1_labels.append(r1)
             r2_labels.append(r2)
             if r1 != r2 and resolved is None:
                 stats.disputed_unadjudicated_count += 1
+        elif (r1 in ("TP", "FP")) ^ (r2 in ("TP", "FP")):
+            stats.single_reviewed_count += 1
 
     n = len(r1_labels)
     stats.double_reviewed_count = n
@@ -918,6 +948,9 @@ class FindingPooler:
                 prev.reviewer_1_label
                 or prev.reviewer_2_label
                 or prev.adjudicated_label
+                or prev.expert_severity
+                or prev.poc_demonstrates
+                or prev.cluster_error
                 or prev.maintainer_status
                 or prev.notes
             )
@@ -954,6 +987,9 @@ class FindingPooler:
                 canon.reviewer_1_label = matched_prev.reviewer_1_label
                 canon.reviewer_2_label = matched_prev.reviewer_2_label
                 canon.adjudicated_label = matched_prev.adjudicated_label
+                canon.expert_severity = matched_prev.expert_severity
+                canon.poc_demonstrates = matched_prev.poc_demonstrates
+                canon.cluster_error = matched_prev.cluster_error
                 canon.maintainer_status = matched_prev.maintainer_status
                 canon.notes = matched_prev.notes
 
@@ -1222,13 +1258,17 @@ class FindingPooler:
             r1 = cf.reviewer_1_label or "Unlabeled"
             r2 = cf.reviewer_2_label or "Unlabeled"
             adj = cf.resolved_label or "Pending"
+            exp_sev = cf.normalized_expert_severity or "Unrated"
+            poc_dem = cf.normalized_poc_demonstrates or "N/A"
+            cl_err = cf.normalized_cluster_error or "Unchecked"
             lines.extend(
                 [
                     f"## `{cf.canonical_id}` — {cf.title}",
                     f"- **Project**: `{cf.repo_name}` (`{cf.pinned_rev[:12]}`)",
                     f"- **File**: `{cf.file}` ({cf.location})",
-                    f"- **CWE / Severity**: `{cf.cwe or 'N/A'}` | `{cf.severity}`",
+                    f"- **CWE / Reported Severity**: `{cf.cwe or 'N/A'}` | `{cf.severity}`",
                     f"- **Review Status**: Reviewer 1: `{r1}` | Reviewer 2: `{r2}` | Resolved: `{adj}`",
+                    f"- **Expert Pass**: Expert Severity: `{exp_sev}` | PoC Demonstrates: `{poc_dem}` | Cluster Audit: `{cl_err}`",
                     "",
                     f"{cf.description}",
                 ]
@@ -1269,6 +1309,14 @@ class FindingPooler:
                 "recommendation": cf.recommendation,
                 "cwe": cf.cwe,
                 "status": "Open",
+                "reviewer_1_label": cf.reviewer_1_label,
+                "reviewer_2_label": cf.reviewer_2_label,
+                "adjudicated_label": cf.adjudicated_label,
+                "expert_severity": cf.expert_severity,
+                "poc_demonstrates": cf.poc_demonstrates,
+                "cluster_error": cf.cluster_error,
+                "maintainer_status": cf.maintainer_status,
+                "notes": cf.notes,
                 "history": [],
             }
             for cf in pool
