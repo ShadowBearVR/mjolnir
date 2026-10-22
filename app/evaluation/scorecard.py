@@ -58,9 +58,14 @@ class ScorecardGenerator:
     }
 
     @staticmethod
-    def _get_mjolnir_commit() -> str:
+    def _resolve_repo_root() -> Path:
+        file_root = Path(__file__).resolve().parent.parent.parent
+        return file_root if (file_root / ".git").exists() else Path.cwd()
+
+    @classmethod
+    def _get_mjolnir_commit(cls) -> str:
         try:
-            repo_root = Path(__file__).resolve().parent.parent.parent
+            repo_root = cls._resolve_repo_root()
             return (
                 subprocess.check_output(
                     ["git", "rev-parse", "HEAD"], cwd=repo_root, stderr=subprocess.DEVNULL
@@ -71,10 +76,10 @@ class ScorecardGenerator:
         except Exception:
             return "unknown"
 
-    @staticmethod
-    def _is_mjolnir_dirty() -> bool:
+    @classmethod
+    def _is_mjolnir_dirty(cls) -> bool:
         try:
-            repo_root = Path(__file__).resolve().parent.parent.parent
+            repo_root = cls._resolve_repo_root()
             out = (
                 subprocess.check_output(
                     ["git", "status", "--porcelain"], cwd=repo_root, stderr=subprocess.DEVNULL
@@ -154,6 +159,30 @@ class ScorecardGenerator:
             CanonicalFinding.model_validate(c)
             for c in json.loads(pool_path.read_text(encoding="utf-8"))
         ]
+        # Propagate human labels from sibling canonical ../pinned/blind_review_pool.json (e.g. into stability/)
+        sibling_pinned_pool = eval_dir.parent / "pinned" / "blind_review_pool.json"
+        if eval_dir.name != "pinned" and sibling_pinned_pool.exists():
+            try:
+                pinned_by_cid = {
+                    c["canonical_id"]: CanonicalFinding.model_validate(c)
+                    for c in json.loads(sibling_pinned_pool.read_text(encoding="utf-8"))
+                    if isinstance(c, dict) and c.get("canonical_id")
+                }
+                for cf in pool:
+                    src = pinned_by_cid.get(cf.canonical_id)
+                    if src is not None:
+                        if not cf.reviewer_1_label and src.reviewer_1_label:
+                            cf.reviewer_1_label = src.reviewer_1_label
+                        if not cf.reviewer_2_label and src.reviewer_2_label:
+                            cf.reviewer_2_label = src.reviewer_2_label
+                        if not cf.adjudicated_label and src.adjudicated_label:
+                            cf.adjudicated_label = src.adjudicated_label
+                        if not cf.maintainer_status and src.maintainer_status:
+                            cf.maintainer_status = src.maintainer_status
+                        if not cf.notes and src.notes:
+                            cf.notes = src.notes
+            except Exception as e:
+                logger.warning(f"Could not sync labels from {sibling_pinned_pool}: {e}")
         mappings = [
             FindingPoolMapping.model_validate(m)
             for m in json.loads(mapping_path.read_text(encoding="utf-8"))

@@ -17,8 +17,9 @@ from evaluation.grader import (
     compute_inter_rater_stats,
     compute_phase_transitions,
     extract_phase_checkpoint_findings,
+    parse_line_range,
 )
-from evaluation.models import CanonicalFinding, TrialRunRecord
+from evaluation.models import CanonicalFinding, RootCauseJudgeVerdict, TrialRunRecord
 from evaluation.runner import (
     format_model_slug,
     parse_usage_metrics,
@@ -707,6 +708,159 @@ class TestEvaluationHarness(unittest.TestCase):
                     fallback_file="runtime/src",
                 )
             )
+
+    def test_pure_llm_judge_and_unified_stability_pool(self) -> None:
+        self.assertEqual(
+            parse_line_range("AddSubjectAltNameCmd::execute (L28-50); dispatch (~L422)"),
+            (28, 50),
+        )
+        self.assertEqual(parse_line_range("InvokeDpeCmd::execute_mldsa87"), (None, None))
+
+        judge_pairs: list[tuple[str, str]] = []
+
+        class StubArgonPooler(FindingPooler):
+            def _run_llm_equivalence_judge(
+                self, canon, file_path, loc_str, cwe_str, title_str, desc_str
+            ):
+                judge_pairs.append((canon.title, title_str))
+                is_same = "Quota" in canon.title and "Quota" in title_str
+                return RootCauseJudgeVerdict(is_match=is_same, rationale="stub verdict")
+
+        rep1 = TrialRunRecord(
+            project_name="Caliptra SW",
+            repo_name="caliptra-sw",
+            pinned_rev="262470b",
+            target_dir="runtime/src",
+            ablation_tier="full",
+            tier_name="Mjolnir Full",
+            model="gemini-3.8-flash",
+            repetition=1,
+            wall_clock_seconds=10.0,
+            open_findings_count=2,
+            findings=[
+                {
+                    "id": "f1",
+                    "file": "runtime/src/invoke_dpe.rs",
+                    "location": "runtime/src/invoke_dpe.rs:InvokeDpeCmd::execute",
+                    "cwe": "CWE-770",
+                    "status": "Open",
+                    "title": "PL1 DPE Quota Bypass",
+                    "description": "PL1 caller exhausts PL0 quota via CALIPTRA_LOCALITY.",
+                    "history": [],
+                },
+                {
+                    "id": "f2",
+                    "file": "runtime/src/invoke_dpe.rs",
+                    "location": "execute_ecc384",
+                    "cwe": "CWE-20",
+                    "status": "Open",
+                    "title": "ECC384 size check missing",
+                    "description": "Missing mailbox size check.",
+                    "history": [],
+                },
+            ],
+        )
+        rep2 = TrialRunRecord(
+            project_name="Caliptra SW",
+            repo_name="caliptra-sw",
+            pinned_rev="262470b",
+            target_dir="runtime/src",
+            ablation_tier="full",
+            tier_name="Mjolnir Full",
+            model="gemini-3.8-flash",
+            repetition=2,
+            wall_clock_seconds=10.0,
+            open_findings_count=2,
+            findings=[
+                {
+                    "id": "f3",
+                    "file": "runtime/src/invoke_dpe.rs",
+                    "location": "runtime/src/invoke_dpe.rs:188-220",
+                    "cwe": "CWE-770",
+                    "status": "Open",
+                    "title": "PL1 DPE Quota Exhaustion",
+                    "description": "PL1 caller exhausts PL0 quota via CALIPTRA_LOCALITY.",
+                    "history": [],
+                },
+                {
+                    "id": "f4",
+                    "file": "runtime/src/invoke_dpe.rs",
+                    "location": "execute_mldsa87",
+                    "cwe": "CWE-20",
+                    "status": "Open",
+                    "title": "MLDSA87 size check missing",
+                    "description": "Missing mailbox size check.",
+                    "history": [],
+                },
+            ],
+        )
+        rep4_stab = TrialRunRecord(
+            project_name="Caliptra SW",
+            repo_name="caliptra-sw",
+            pinned_rev="262470b",
+            target_dir="runtime/src",
+            ablation_tier="full",
+            tier_name="Mjolnir Full",
+            model="gemini-3.8-flash",
+            repetition=4,
+            wall_clock_seconds=10.0,
+            open_findings_count=1,
+            findings=[
+                {
+                    "id": "f5",
+                    "file": "runtime/src/invoke_dpe.rs",
+                    "location": "InvokeDpeCmd::execute (L190-215)",
+                    "cwe": "CWE-284",
+                    "status": "Open",
+                    "title": "Quota Exhaustion in DeriveContext",
+                    "description": "Different CWE but same root cause.",
+                    "history": [],
+                }
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pinned_dir = root / "pinned"
+            stab_dir = root / "stability"
+            pinned_dir.mkdir()
+            stab_dir.mkdir()
+            (pinned_dir / "trials_manifest.json").write_text(
+                json.dumps([rep1.model_dump(), rep2.model_dump()], indent=2),
+                encoding="utf-8",
+            )
+            (stab_dir / "trials_manifest.json").write_text(
+                json.dumps(
+                    [rep1.model_dump(), rep2.model_dump(), rep4_stab.model_dump()], indent=2
+                ),
+                encoding="utf-8",
+            )
+
+            pooler = StubArgonPooler(judge_model="gemini-4-argon")
+            pool, _ = pooler.build_pool(
+                trials=[rep1, rep2],
+                output_dir=pinned_dir,
+                extra_eval_dirs=[stab_dir],
+                rebuild=True,
+            )
+
+            # Even though f1 and f3 share CWE-770 and high lexical overlap, pure LLM judge must be invoked
+            self.assertGreaterEqual(len(judge_pairs), 2)
+            # execute_ecc384 vs execute_mldsa87 are distinct functions -> rejected by location gate without LLM call
+            self.assertFalse(any("ECC384" in a and "MLDSA87" in b for a, b in judge_pairs))
+            # Quota bug merged across rep1, rep2, and stability rep4; ECC384 and MLDSA87 kept separate -> 3 clusters
+            self.assertEqual(len(pool), 3)
+
+            # Label only pinned/blind_review_pool.json and verify stability scorecard inherits TP labels
+            for cf in pool:
+                cf.adjudicated_label = "TP" if "Quota" in cf.title else "FP"
+            (pinned_dir / "blind_review_pool.json").write_text(
+                json.dumps([c.model_dump() for c in pool], indent=2),
+                encoding="utf-8",
+            )
+            stab_summaries = ScorecardGenerator().generate_scorecard(stab_dir)
+            self.assertEqual(stab_summaries[0].repetitions, 3)
+            self.assertEqual(stab_summaries[0].consistent_tps_all_reps, 1)
 
 
 if __name__ == "__main__":

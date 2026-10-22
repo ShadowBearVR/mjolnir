@@ -11,7 +11,7 @@ let
       targetDir = evalCfg.targetDir or null;
       threatModel = evalCfg.threatModel or null;
       evaluatorModel = evalCfg.evaluatorModel or "gemini-3.8-flash";
-      judgeModel = evalCfg.judgeModel or "gemini-3.8-flash";
+      judgeModel = evalCfg.judgeModel or "gemini-4-argon";
       minPocSeverity = evalCfg.minPocSeverity or "Informational";
       batchSize = evalCfg.batchSize or 64;
       extensions = evalCfg.extensions or [ "rs" "c" "h" ];

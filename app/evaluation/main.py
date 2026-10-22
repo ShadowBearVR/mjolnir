@@ -42,7 +42,7 @@ def _add_run_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--judge-model",
-        help="Optional LLM model for semantic root-cause clustering (e.g. gemini-3.8-flash)",
+        help="Optional LLM model for semantic root-cause clustering (e.g. gemini-4-argon)",
     )
     p.add_argument(
         "--no-expand-checkpoints",
@@ -83,7 +83,7 @@ def main() -> None:
     # 1. run (and alias benchmark) subcommand
     run_parser = subparsers.add_parser(
         "run",
-        help="Run Mjolnir ablation tiers and external CLI/SAST baselines on the pinned repository snapshot",
+        help="Run Mjolnir ablation tiers and single-agent baselines on the pinned repository snapshot",
     )
     _add_run_arguments(run_parser)
 
@@ -104,8 +104,19 @@ def main() -> None:
         help="Evaluation output directory containing trials_manifest.json",
     )
     pool_parser.add_argument(
+        "--extra-eval-dir",
+        action="append",
+        default=[],
+        help="Additional evaluation run directory (e.g. stability) to pool into one unified canonical deck",
+    )
+    pool_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Re-cluster from scratch instead of reusing finding_pool_mapping.json (still preserves human labels)",
+    )
+    pool_parser.add_argument(
         "--judge-model",
-        help="Optional LLM model for semantic root-cause clustering",
+        help="Optional LLM model for semantic root-cause clustering (e.g. gemini-4-argon)",
     )
 
     # 3. scorecard subcommand
@@ -170,9 +181,15 @@ def main() -> None:
         target_dir = eval_dir.parent if eval_dir.is_file() else eval_dir
         raw_trials = json.loads(manifest_path.read_text(encoding="utf-8"))
         trials = [TrialRunRecord.model_validate(t) for t in raw_trials]
+        extra_dirs = [Path(p) for p in (args.extra_eval_dir or [])]
         FindingPooler(
             judge_model=args.judge_model or spec.get("project", {}).get("judgeModel")
-        ).build_pool(trials=trials, output_dir=target_dir)
+        ).build_pool(
+            trials=trials,
+            output_dir=target_dir,
+            extra_eval_dirs=extra_dirs,
+            rebuild=args.rebuild,
+        )
     elif args.subcommand == "scorecard":
         eval_path = Path(args.eval_path)
         out_dir = Path(args.output_dir) if args.output_dir else None

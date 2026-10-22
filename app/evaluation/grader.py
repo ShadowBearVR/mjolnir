@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import threading
 
 import constants as mjolnir_constants
 from evaluation.constants import ORDERED_PIPELINE_PHASES, SEVERITY_RANKS
@@ -248,7 +249,7 @@ class CweHierarchyMatcher:
         self.parents_map: dict[str, set[str]] = {}
         if catalog_path.exists():
             data = json.loads(catalog_path.read_text(encoding="utf-8"))
-            weaknesses = data.get("weaknesses", {})
+            weaknesses = data.get("weaknesses") or data.get("cwes") or {}
             for cwe_key, info in weaknesses.items():
                 norm_id = self.normalize_cwe(cwe_key)
                 parents = {self.normalize_cwe(f"CWE-{p}") for p in info.get("parents", [])}
@@ -307,14 +308,57 @@ def extract_cwe_from_vuln(vuln: dict) -> str:
     return ""
 
 
+GENERIC_LOCATION_TOKENS = frozenset(
+    {
+        "line",
+        "lines",
+        "function",
+        "fn",
+        "method",
+        "impl",
+        "execute",
+        "new",
+        "run",
+        "init",
+        "main",
+        "default",
+        "from",
+        "into",
+        "try_from",
+        "cmd",
+        "command",
+        "rs",
+        "sv",
+        "c",
+        "h",
+        "cpp",
+        "py",
+        "src",
+        "runtime",
+    }
+)
+
+
 def parse_line_range(location_str: str) -> tuple[int | None, int | None]:
     """Extracts (start_line, end_line) from a location string if line numbers are present."""
-    nums = [int(m) for m in re.findall(r"\b(\d+)\b", str(location_str or ""))]
+    nums = [
+        int(m) for m in re.findall(r"(?:^|(?<![A-Za-z0-9_])|[Ll])(\d+)\b", str(location_str or ""))
+    ]
     if not nums:
         return None, None
     first = nums[0]
     near = [n for n in nums if abs(n - first) <= 80]
     return min(near), max(near)
+
+
+def extract_location_functions(file_path: str, location_str: str) -> set[str]:
+    """Extracts qualified (Type::method) and specific unqualified function tokens from a location string."""
+    s = str(location_str or "")
+    qual = {m.lower() for m in re.findall(r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*", s)}
+    file_tokens = keyword_tokens(file_path) | GENERIC_LOCATION_TOKENS
+    unqual_s = re.sub(r"[A-Za-z0-9_]+::", "", s)
+    unqual = keyword_tokens(unqual_s) - file_tokens
+    return qual | unqual
 
 
 def sanitize_blind_text(text: str) -> str:
@@ -418,13 +462,27 @@ class FindingPooler:
         self.cwe_matcher = CweHierarchyMatcher()
         self.judge_model = judge_model
         self._genai_client = None
+        self._cache_lock = threading.Lock()
         self._judge_cache: dict[str, RootCauseJudgeVerdict] = {}
+        self._judge_audit_log: dict[str, dict] = {}
+        self._judge_cache_path: Path | None = None
+        self._new_judge_calls: int = 0
+        self._llm_error_count: int = 0
+
+    def _flush_judge_cache(self) -> None:
+        if not self._judge_cache_path or not self._judge_audit_log:
+            return
+        tmp_path = self._judge_cache_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(self._judge_audit_log, indent=2), encoding="utf-8")
+        tmp_path.replace(self._judge_cache_path)
 
     def build_pool(
         self,
         trials: list[TrialRunRecord],
         output_dir: Path,
         existing_pool_path: Path | None = None,
+        extra_eval_dirs: list[Path] | None = None,
+        rebuild: bool = False,
     ) -> tuple[list[CanonicalFinding], list[FindingPoolMapping]]:
         """Clusters all trial findings, preserves any existing human labels, and writes blind review artifacts."""
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -437,11 +495,52 @@ class FindingPooler:
             except Exception as e:
                 logger.warning(f"Could not load existing blind review pool from {pool_file}: {e}")
 
-        # Reuse previous cluster decisions from finding_pool_mapping.json so incremental runs
-        # do not re-invoke the LLM judge on already-clustered trials.
+        # Load persistent LLM judge verdict cache matching the active judge model
+        self._judge_cache_path = output_dir / "llm_judge_cache.json"
+        if self._judge_cache_path.exists() and self.judge_model:
+            try:
+                raw_cache = json.loads(self._judge_cache_path.read_text(encoding="utf-8"))
+                if isinstance(raw_cache, dict):
+                    for ck, entry in raw_cache.items():
+                        if isinstance(entry, dict) and entry.get("model") == self.judge_model:
+                            self._judge_audit_log[ck] = entry
+                            self._judge_cache[ck] = RootCauseJudgeVerdict(
+                                is_match=bool(entry.get("is_match")),
+                                rationale=str(entry.get("rationale") or ""),
+                            )
+            except Exception as e:
+                logger.warning(f"Could not load existing llm_judge_cache.json: {e}")
+
+        primary_trial_keys = {(t.ablation_tier, t.repetition) for t in trials}
+        combined_trials = list(trials)
+        seen_trial_keys = set(primary_trial_keys)
+        extra_dir_trial_keys: list[tuple[Path, set[tuple[str, int]]]] = []
+        for extra_dir in extra_eval_dirs or []:
+            extra_manifest = (
+                extra_dir if extra_dir.is_file() else extra_dir / "trials_manifest.json"
+            )
+            extra_target_dir = extra_dir.parent if extra_dir.is_file() else extra_dir
+            if not extra_manifest.exists():
+                logger.warning(f"Extra trials manifest not found: {extra_manifest}")
+                continue
+            extra_records = [
+                TrialRunRecord.model_validate(item)
+                for item in json.loads(extra_manifest.read_text(encoding="utf-8"))
+            ]
+            e_keys = {(t.ablation_tier, t.repetition) for t in extra_records}
+            extra_dir_trial_keys.append((extra_target_dir, e_keys))
+            for t in extra_records:
+                tk = (t.ablation_tier, t.repetition)
+                if tk not in seen_trial_keys:
+                    seen_trial_keys.add(tk)
+                    combined_trials.append(t)
+        trials = combined_trials
+
+        # Reuse previous cluster decisions from finding_pool_mapping.json on incremental runs
+        # unless rebuild=True was requested.
         prev_cid_by_run_id: dict[tuple[str, int, str, str], str] = {}
         mapping_file = output_dir / "finding_pool_mapping.json"
-        if mapping_file.exists():
+        if not rebuild and mapping_file.exists():
             try:
                 raw_mappings = json.loads(mapping_file.read_text(encoding="utf-8"))
                 for m_item in raw_mappings:
@@ -646,73 +745,11 @@ class FindingPooler:
                             continue
                         cand_canons.append((idx, canon))
 
-                    # Pass 1: check fast deterministic equivalence across all candidates before invoking LLM judge
-                    for idx, canon in cand_canons:
-                        if self._findings_equivalent(
-                            canon=canon,
-                            file_path=raw_file,
-                            loc_str=loc_str,
-                            start_ln=start_ln,
-                            end_ln=end_ln,
-                            cwe_str=cwe_str,
-                            title_str=title_str,
-                            desc_str=desc_str,
-                            use_llm=False,
-                        ):
-                            matched_idx = idx
-                            break
-
-                    if (
-                        matched_idx is None
-                        and cand_canons
-                        and self.judge_model
-                        and self.judge_model not in ("mock", "heuristic")
-                    ):
-                        if self._genai_client is None:
-                            import os
-                            from google.genai import Client, types
-
-                            os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
-                            vertexai = not bool(os.environ.get("GEMINI_API_KEY"))
-                            self._genai_client = Client(
-                                vertexai=vertexai,
-                                location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-                                if vertexai
-                                else None,
-                                http_options=types.HttpOptions(
-                                    timeout=45000,
-                                    retry_options=types.HttpRetryOptions(
-                                        attempts=3, initial_delay=1.0, max_delay=10.0
-                                    ),
-                                ),
-                            )
-
-                        if len(cand_canons) > 1:
-                            from concurrent.futures import ThreadPoolExecutor
-
-                            with ThreadPoolExecutor(max_workers=min(4, len(cand_canons))) as ex:
-                                results = list(
-                                    ex.map(
-                                        lambda item: self._findings_equivalent(
-                                            canon=item[1],
-                                            file_path=raw_file,
-                                            loc_str=loc_str,
-                                            start_ln=start_ln,
-                                            end_ln=end_ln,
-                                            cwe_str=cwe_str,
-                                            title_str=title_str,
-                                            desc_str=desc_str,
-                                            use_llm=True,
-                                        ),
-                                        cand_canons,
-                                    )
-                                )
-                            for (idx, _canon), is_eq in zip(cand_canons, results):
-                                if is_eq:
-                                    matched_idx = idx
-                                    break
-                        else:
-                            idx, canon = cand_canons[0]
+                    has_real_llm_judge = bool(
+                        self.judge_model and self.judge_model not in ("mock", "heuristic")
+                    )
+                    if not has_real_llm_judge:
+                        for idx, canon in cand_canons:
                             if self._findings_equivalent(
                                 canon=canon,
                                 file_path=raw_file,
@@ -722,9 +759,74 @@ class FindingPooler:
                                 cwe_str=cwe_str,
                                 title_str=title_str,
                                 desc_str=desc_str,
-                                use_llm=True,
+                                use_llm=False,
                             ):
                                 matched_idx = idx
+                                break
+                    elif cand_canons:
+                        loc_cands = [
+                            (idx, canon)
+                            for idx, canon in cand_canons
+                            if self._location_matches(canon, raw_file, loc_str, start_ln, end_ln)
+                        ]
+                        if loc_cands:
+                            if self._genai_client is None:
+                                import os
+                                from google.genai import Client, types
+
+                                os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
+                                vertexai = not bool(os.environ.get("GEMINI_API_KEY"))
+                                self._genai_client = Client(
+                                    vertexai=vertexai,
+                                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+                                    if vertexai
+                                    else None,
+                                    http_options=types.HttpOptions(
+                                        timeout=60000,
+                                        retry_options=types.HttpRetryOptions(
+                                            attempts=5, initial_delay=1.5, max_delay=20.0
+                                        ),
+                                    ),
+                                )
+
+                            if len(loc_cands) > 1:
+                                from concurrent.futures import ThreadPoolExecutor
+
+                                with ThreadPoolExecutor(max_workers=min(4, len(loc_cands))) as ex:
+                                    results = list(
+                                        ex.map(
+                                            lambda item: self._findings_equivalent(
+                                                canon=item[1],
+                                                file_path=raw_file,
+                                                loc_str=loc_str,
+                                                start_ln=start_ln,
+                                                end_ln=end_ln,
+                                                cwe_str=cwe_str,
+                                                title_str=title_str,
+                                                desc_str=desc_str,
+                                                use_llm=True,
+                                            ),
+                                            loc_cands,
+                                        )
+                                    )
+                                for (idx, _canon), is_eq in zip(loc_cands, results):
+                                    if is_eq:
+                                        matched_idx = idx
+                                        break
+                            else:
+                                idx, canon = loc_cands[0]
+                                if self._findings_equivalent(
+                                    canon=canon,
+                                    file_path=raw_file,
+                                    loc_str=loc_str,
+                                    start_ln=start_ln,
+                                    end_ln=end_ln,
+                                    cwe_str=cwe_str,
+                                    title_str=title_str,
+                                    desc_str=desc_str,
+                                    use_llm=True,
+                                ):
+                                    matched_idx = idx
 
                 if matched_idx is not None:
                     canon, occs, run_ids = clusters[matched_idx]
@@ -763,6 +865,10 @@ class FindingPooler:
                     if start_ln is not None and canon.start_line is None:
                         canon.start_line = start_ln
                         canon.end_line = end_ln
+                    if not extract_location_functions(
+                        canon.file, canon.location
+                    ) and extract_location_functions(raw_file, loc_str):
+                        canon.location = f"{canon.location} ({loc_str})"
                 else:
                     new_canon = CanonicalFinding(
                         canonical_id="PENDING",
@@ -789,6 +895,9 @@ class FindingPooler:
                         id_set.add(("__prev_cid__", 0, prev_cid))
                     clusters.append((new_canon, [occ], id_set))
                     cluster_best_rank.append(cur_rank)
+
+        with self._cache_lock:
+            self._flush_judge_cache()
 
         # Deterministic hash order so blind review cards do not leak tool execution order
         clusters.sort(
@@ -837,6 +946,7 @@ class FindingPooler:
                         title_str=canon.title,
                         desc_str=canon.description,
                         use_llm=False,
+                        allow_heuristic_fallback=True,
                     ):
                         matched_prev = prev
                         break
@@ -850,24 +960,99 @@ class FindingPooler:
             canonical_pool.append(canon)
             pool_mappings.append(FindingPoolMapping(canonical_id=cid, occurrences=occs))
 
-        (output_dir / "blind_review_pool.json").write_text(
-            json.dumps([c.model_dump() for c in canonical_pool], indent=2),
-            encoding="utf-8",
+        def _filter_mappings_for_keys(
+            allowed_keys: set[tuple[str, int]],
+        ) -> list[FindingPoolMapping]:
+            filtered: list[FindingPoolMapping] = []
+            for m in pool_mappings:
+                sub_occs = [
+                    o for o in m.occurrences if (o.ablation_tier, o.repetition) in allowed_keys
+                ]
+                if sub_occs:
+                    filtered.append(
+                        FindingPoolMapping(canonical_id=m.canonical_id, occurrences=sub_occs)
+                    )
+            return filtered
+
+        primary_mappings = (
+            _filter_mappings_for_keys(primary_trial_keys) if extra_dir_trial_keys else pool_mappings
         )
+        pool_json = json.dumps([c.model_dump() for c in canonical_pool], indent=2)
+        pool_md = self._render_blind_review_markdown(canonical_pool)
+
+        (output_dir / "blind_review_pool.json").write_text(pool_json, encoding="utf-8")
         (output_dir / "finding_pool_mapping.json").write_text(
-            json.dumps([m.model_dump() for m in pool_mappings], indent=2),
+            json.dumps([m.model_dump() for m in primary_mappings], indent=2),
             encoding="utf-8",
         )
-        (output_dir / "blind_review_pool.md").write_text(
-            self._render_blind_review_markdown(canonical_pool),
-            encoding="utf-8",
-        )
+        (output_dir / "blind_review_pool.md").write_text(pool_md, encoding="utf-8")
         self._write_blind_review_web_bundle(canonical_pool, output_dir / "blind_review")
+
+        for extra_target_dir, e_keys in extra_dir_trial_keys:
+            extra_target_dir.mkdir(parents=True, exist_ok=True)
+            extra_mappings = _filter_mappings_for_keys(e_keys)
+            (extra_target_dir / "blind_review_pool.json").write_text(pool_json, encoding="utf-8")
+            (extra_target_dir / "finding_pool_mapping.json").write_text(
+                json.dumps([m.model_dump() for m in extra_mappings], indent=2),
+                encoding="utf-8",
+            )
+            (extra_target_dir / "blind_review_pool.md").write_text(pool_md, encoding="utf-8")
+            self._write_blind_review_web_bundle(canonical_pool, extra_target_dir / "blind_review")
+            logger.success(
+                f"Synced unified pool ({len(canonical_pool)} canonical findings, {len(extra_mappings)} mapped clusters) to {extra_target_dir}"
+            )
+
         logger.success(
             f"Exported {len(canonical_pool)} canonical findings to {output_dir / 'blind_review_pool.json'} "
-            f"(and hidden provenance map to {output_dir / 'finding_pool_mapping.json'})"
+            f"(new LLM judge calls={self._new_judge_calls}, cached={len(self._judge_cache)}, llm_errors={self._llm_error_count})"
         )
-        return canonical_pool, pool_mappings
+        return canonical_pool, primary_mappings
+
+    @staticmethod
+    def _location_matches(
+        canon: CanonicalFinding,
+        file_path: str,
+        loc_str: str,
+        start_ln: int | None,
+        end_ln: int | None,
+    ) -> bool:
+        """Checks whether two findings point to the same file and within 35 lines or the same function."""
+        c_file = canon.file.replace("\\", "/").lstrip("./")
+        f_file = file_path.replace("\\", "/").lstrip("./")
+        if not (c_file == f_file or c_file.endswith("/" + f_file) or f_file.endswith("/" + c_file)):
+            return False
+
+        margin = 35
+        both_have_lines = canon.start_line is not None and start_ln is not None
+        span_overlap = False
+        if both_have_lines:
+            c_end = canon.end_line if canon.end_line is not None else canon.start_line
+            f_end = end_ln if end_ln is not None else start_ln
+            if (canon.start_line - margin) <= f_end and (start_ln - margin) <= c_end:
+                span_overlap = True
+
+        loc_tokens_a = extract_location_functions(canon.file, canon.location)
+        loc_tokens_b = extract_location_functions(file_path, loc_str)
+        lines_far_apart = (
+            both_have_lines
+            and not span_overlap
+            and abs((canon.start_line or 0) - (start_ln or 0)) > (2 * margin)
+        )
+        shared_func = bool(
+            not lines_far_apart and loc_tokens_a and loc_tokens_b and (loc_tokens_a & loc_tokens_b)
+        )
+        if span_overlap or shared_func:
+            return True
+
+        # If one finding reported only a function name (no lines) and the other reported only line
+        # numbers (no function name), syntactic comparison alone cannot rule out containment.
+        if not both_have_lines and (
+            (canon.start_line is None and bool(loc_tokens_a) and not loc_tokens_b)
+            or (start_ln is None and bool(loc_tokens_b) and not loc_tokens_a)
+        ):
+            return True
+
+        return False
 
     def _findings_equivalent(
         self,
@@ -880,94 +1065,19 @@ class FindingPooler:
         title_str: str,
         desc_str: str,
         use_llm: bool = True,
+        allow_heuristic_fallback: bool = False,
     ) -> bool:
-        # Step 1: File & Span Localization Check
-        c_file = canon.file.replace("\\", "/").lstrip("./")
-        f_file = file_path.replace("\\", "/").lstrip("./")
-        if not (c_file == f_file or c_file.endswith("/" + f_file) or f_file.endswith("/" + c_file)):
+        # Step 1: File & Localization Gate (within 35 lines or the same function)
+        if not self._location_matches(canon, file_path, loc_str, start_ln, end_ln):
             return False
 
-        margin = 35
-        span_overlap = False
-        if canon.start_line is not None and start_ln is not None:
-            c_end = canon.end_line if canon.end_line is not None else canon.start_line
-            f_end = end_ln if end_ln is not None else start_ln
-            if (canon.start_line - margin) <= f_end and (start_ln - margin) <= c_end:
-                span_overlap = True
-
-        file_tokens = keyword_tokens(file_path) | {
-            "line",
-            "lines",
-            "function",
-            "execute",
-            "new",
-            "run",
-            "init",
-            "main",
-            "default",
-            "from",
-            "into",
-            "try_from",
-            "cmd",
-            "command",
-            "rs",
-            "sv",
-            "c",
-            "h",
-            "cpp",
-            "py",
-        }
-        loc_a_unqual = re.sub(r"[A-Za-z0-9_]+::", "", str(canon.location or ""))
-        loc_b_unqual = re.sub(r"[A-Za-z0-9_]+::", "", str(loc_str or ""))
-        loc_tokens_a = keyword_tokens(loc_a_unqual) - file_tokens
-        loc_tokens_b = keyword_tokens(loc_b_unqual) - file_tokens
-        both_have_lines = canon.start_line is not None and start_ln is not None
-        lines_far_apart = (
-            both_have_lines
-            and not span_overlap
-            and abs((canon.start_line or 0) - (start_ln or 0)) > (2 * margin)
+        # Step 2: Root-Cause Equivalence via Pure LLM Judge (with offline heuristic fallback for tests)
+        has_real_llm_judge = bool(
+            self.judge_model and self.judge_model not in ("mock", "heuristic")
         )
-        shared_func = bool(
-            not lines_far_apart and loc_tokens_a and loc_tokens_b and (loc_tokens_a & loc_tokens_b)
-        )
-
-        cwe_equiv = bool(
-            canon.cwe and cwe_str and self.cwe_matcher.are_equivalent(canon.cwe, cwe_str)
-        )
-        toks_a = keyword_tokens(f"{canon.title} {canon.description}")
-        toks_b = keyword_tokens(f"{title_str} {desc_str}")
-        kw_jaccard = (len(toks_a & toks_b) / len(toks_a | toks_b)) if (toks_a and toks_b) else 0.0
-
-        if not span_overlap and not shared_func:
-            if both_have_lines or (not cwe_equiv and kw_jaccard < 0.25):
+        if has_real_llm_judge and not allow_heuristic_fallback:
+            if not use_llm:
                 return False
-
-        # Step 2: CWE Hierarchy or Semantic Root-Cause Equivalence
-        if cwe_equiv and (
-            ((span_overlap or shared_func) and kw_jaccard >= 0.25) or kw_jaccard >= 0.35
-        ):
-            return True
-
-        if kw_jaccard >= 0.30 and (span_overlap or shared_func or not canon.start_line):
-            return True
-
-        if (
-            canon.start_line is not None
-            and start_ln is not None
-            and abs(canon.start_line - start_ln) <= 10
-            and (not canon.cwe or not cwe_str or cwe_equiv)
-            and kw_jaccard >= 0.25
-        ):
-            return True
-
-        if not use_llm:
-            return False
-
-        if (
-            kw_jaccard >= 0.08
-            and self.judge_model
-            and self.judge_model not in ("mock", "heuristic")
-        ):
             verdict = self._run_llm_equivalence_judge(
                 canon=canon,
                 file_path=file_path,
@@ -976,10 +1086,15 @@ class FindingPooler:
                 title_str=title_str,
                 desc_str=desc_str,
             )
-            if verdict is not None:
-                return verdict.is_match
+            return bool(verdict and verdict.is_match)
 
-        return False
+        cwe_equiv = bool(
+            canon.cwe and cwe_str and self.cwe_matcher.are_equivalent(canon.cwe, cwe_str)
+        )
+        toks_a = keyword_tokens(f"{canon.title} {canon.description}")
+        toks_b = keyword_tokens(f"{title_str} {desc_str}")
+        kw_jaccard = (len(toks_a & toks_b) / len(toks_a | toks_b)) if (toks_a and toks_b) else 0.0
+        return bool(cwe_equiv and kw_jaccard >= 0.25)
 
     def _run_llm_equivalence_judge(
         self,
@@ -994,22 +1109,24 @@ class FindingPooler:
             import os
             from google.genai import Client, types
 
+            finding_a_obj = {
+                "file": canon.file,
+                "location": canon.location,
+                "cwe": canon.cwe,
+                "title": canon.title,
+                "description": canon.description[:600],
+            }
+            finding_b_obj = {
+                "file": file_path,
+                "location": loc_str,
+                "cwe": cwe_str,
+                "title": title_str,
+                "description": desc_str[:600],
+            }
             prompt = json.dumps(
                 {
-                    "finding_a": {
-                        "file": canon.file,
-                        "location": canon.location,
-                        "cwe": canon.cwe,
-                        "title": canon.title,
-                        "description": canon.description[:600],
-                    },
-                    "finding_b": {
-                        "file": file_path,
-                        "location": loc_str,
-                        "cwe": cwe_str,
-                        "title": title_str,
-                        "description": desc_str[:600],
-                    },
+                    "finding_a": finding_a_obj,
+                    "finding_b": finding_b_obj,
                 },
                 indent=2,
             )
@@ -1027,24 +1144,24 @@ class FindingPooler:
                     ]
                 ).encode("utf-8")
             ).hexdigest()
-            if cache_key in self._judge_cache:
-                return self._judge_cache[cache_key]
-
-            if self._genai_client is None:
-                os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
-                vertexai = not bool(os.environ.get("GEMINI_API_KEY"))
-                self._genai_client = Client(
-                    vertexai=vertexai,
-                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-                    if vertexai
-                    else None,
-                    http_options=types.HttpOptions(
-                        timeout=45000,
-                        retry_options=types.HttpRetryOptions(
-                            attempts=3, initial_delay=1.0, max_delay=10.0
+            with self._cache_lock:
+                if cache_key in self._judge_cache:
+                    return self._judge_cache[cache_key]
+                if self._genai_client is None:
+                    os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
+                    vertexai = not bool(os.environ.get("GEMINI_API_KEY"))
+                    self._genai_client = Client(
+                        vertexai=vertexai,
+                        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+                        if vertexai
+                        else None,
+                        http_options=types.HttpOptions(
+                            timeout=60000,
+                            retry_options=types.HttpRetryOptions(
+                                attempts=5, initial_delay=1.5, max_delay=20.0
+                            ),
                         ),
-                    ),
-                )
+                    )
 
             resp = self._genai_client.models.generate_content(
                 model=self.judge_model,
@@ -1068,10 +1185,28 @@ class FindingPooler:
             )
             verdict = RootCauseJudgeVerdict.model_validate(parsed) if parsed else None
             if verdict is not None:
-                self._judge_cache[cache_key] = verdict
+                with self._cache_lock:
+                    self._judge_cache[cache_key] = verdict
+                    self._judge_audit_log[cache_key] = {
+                        "model": self.judge_model,
+                        "is_match": verdict.is_match,
+                        "rationale": verdict.rationale,
+                        "finding_a": finding_a_obj,
+                        "finding_b": finding_b_obj,
+                    }
+                    self._new_judge_calls += 1
+                    if self._new_judge_calls % 25 == 0:
+                        matches = sum(1 for v in self._judge_cache.values() if v.is_match)
+                        logger.info(
+                            f"[{self.judge_model}] {self._new_judge_calls} new judge calls "
+                            f"(total cached={len(self._judge_cache)}, matches={matches}, errors={self._llm_error_count})"
+                        )
+                        self._flush_judge_cache()
             return verdict
         except Exception as e:
-            logger.warning(f"LLM root-cause equivalence judge fallback to heuristic: {e}")
+            with self._cache_lock:
+                self._llm_error_count += 1
+            logger.warning(f"LLM root-cause equivalence judge error: {e}")
             return None
 
     @staticmethod
