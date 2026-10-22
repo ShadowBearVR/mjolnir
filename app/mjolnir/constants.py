@@ -104,9 +104,17 @@ BUILD_CONFIGURATION_FILES = frozenset(
         "cargo.lock",
         "build",
         "build.bazel",
+        "module.bazel.lock",
         "cmakelists.txt",
         "makefile",
     }
+)
+
+SANDBOX_GIT_DIFF_EXCLUDES = (
+    ":!.mjolnir_tags*",
+    ":!tags*",
+    ":!MODULE.bazel.lock",
+    ":!**/MODULE.bazel.lock",
 )
 
 SANDBOX_ALLOWED_ENV_VARS = frozenset(

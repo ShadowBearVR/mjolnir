@@ -19,6 +19,7 @@ from constants import (
     POC_ARTIFACTS_SUBDIR,
     POC_WORKTREES_SUBDIR,
     SANDBOX_ALLOWED_ENV_VARS,
+    SANDBOX_GIT_DIFF_EXCLUDES,
     TEST_PATH_TOKENS,
 )
 from utilities.command import run_command_capture
@@ -193,6 +194,7 @@ class WorktreeSandbox:
                     patterns = [
                         ".mjolnir_tags*",
                         "tags*",
+                        "MODULE.bazel.lock",
                         "target/",
                         CARGO_TARGET_CACHE_SUBDIR + "/",
                         POC_WORKTREES_SUBDIR + "/",
@@ -292,13 +294,13 @@ class WorktreeSandbox:
     def get_diff(self) -> str:
         """Computes unified diff across all modified or added files using git."""
         self._run_git("add", "-N", ".")
-        res = self._run_git("diff", "HEAD", "--", ":!.mjolnir_tags*", ":!tags*")
+        res = self._run_git("diff", "HEAD", "--", *SANDBOX_GIT_DIFF_EXCLUDES)
         return res.stdout if res.returncode == 0 else ""
 
     def get_modified_files(self) -> list[str]:
         """Returns list of relative paths for all modified or newly created files."""
         self._run_git("add", "-N", ".")
-        res = self._run_git("diff", "--name-only", "HEAD", "--", ":!.mjolnir_tags*", ":!tags*")
+        res = self._run_git("diff", "--name-only", "HEAD", "--", *SANDBOX_GIT_DIFF_EXCLUDES)
         return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
     def is_test_or_harness_path(self, rel_path: str) -> bool:

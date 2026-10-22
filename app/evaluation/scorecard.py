@@ -414,6 +414,18 @@ class ScorecardGenerator:
                             result["refusals"]["soft_refusals"] += 1
                             result["refusals"]["total_safety_refusals"] += 1
                             _bump_agent_refusal(ag, "soft_refusals")
+                    elif etype == "output" and tid.startswith("poc_creation_"):
+                        raw_out = str(e.get("content") or "").strip()
+                        if raw_out.startswith("{"):
+                            try:
+                                out_obj = json.loads(raw_out)
+                                if (
+                                    isinstance(out_obj, dict)
+                                    and out_obj.get("poc_verified") is True
+                                ):
+                                    claimed_poc_verified_ids.add(tid[len("poc_creation_") :])
+                            except Exception:
+                                pass
                 elif etype == "tool_response":
                     in_turn = False
                     if not has_direct_phase_tools and pid in result["tool_calls_by_phase"]:
@@ -699,10 +711,15 @@ class ScorecardGenerator:
         unlabeled_counts: list[float] = []
         poc_counts: list[float] = []
         poc_tp_counts: list[float] = []
+        poc_fp_counts: list[float] = []
         open_unverified_counts: list[float] = []
+        unverified_tp_counts: list[float] = []
+        unverified_fp_counts: list[float] = []
         harness_limitation_counts: list[float] = []
         disproved_by_harness_counts: list[float] = []
         precisions: list[float] = []
+        poc_precisions: list[float] = []
+        unverified_precisions: list[float] = []
         precisions_med_plus: list[float] = []
         recalls: list[float] = []
         false_disproofs: list[float] = []
@@ -782,10 +799,21 @@ class ScorecardGenerator:
                 else:
                     unlabeled_cids.add(cid)
 
+            poc_tp_cids = tp_cids & poc_cids
+            poc_fp_cids = fp_cids & poc_cids
+            unver_tp_cids = tp_cids - poc_cids
+            unver_fp_cids = fp_cids - poc_cids
+
             n_tp = len(tp_cids)
             n_tp_med_plus = len(tp_med_plus_cids)
             n_fp = len(fp_cids)
             n_labeled_open = n_tp + n_fp
+            n_poc_tp = len(poc_tp_cids)
+            n_poc_fp = len(poc_fp_cids)
+            n_poc_labeled = n_poc_tp + n_poc_fp
+            n_unver_tp = len(unver_tp_cids)
+            n_unver_fp = len(unver_fp_cids)
+            n_unver_labeled = n_unver_tp + n_unver_fp
             open_findings = [
                 v
                 for v in trial.findings
@@ -831,8 +859,11 @@ class ScorecardGenerator:
             fp_counts.append(float(n_fp))
             unlabeled_counts.append(float(len(unlabeled_cids)))
             poc_counts.append(float(n_poc))
-            poc_tp_counts.append(float(len(poc_tp_cids)))
+            poc_tp_counts.append(float(n_poc_tp))
+            poc_fp_counts.append(float(n_poc_fp))
             open_unverified_counts.append(float(n_open_unverified))
+            unverified_tp_counts.append(float(n_unver_tp))
+            unverified_fp_counts.append(float(n_unver_fp))
             harness_limitation_counts.append(float(n_harness_limitation))
             disproved_by_harness_counts.append(float(n_disproved_by_harness))
 
@@ -840,6 +871,10 @@ class ScorecardGenerator:
                 precisions.append(n_tp / n_labeled_open)
                 if has_any_expert_severity:
                     precisions_med_plus.append(n_tp_med_plus / n_labeled_open)
+            if n_poc_labeled > 0:
+                poc_precisions.append(n_poc_tp / n_poc_labeled)
+            if n_unver_labeled > 0:
+                unverified_precisions.append(n_unver_tp / n_unver_labeled)
             recalls.append(n_tp / total_pooled_tps if total_pooled_tps > 0 else 0.0)
             if n_open > 0:
                 poc_pass_rates.append(n_poc / n_open)
@@ -1125,8 +1160,17 @@ class ScorecardGenerator:
             mean_poc_verified_tps=round(statistics.fmean(poc_tp_counts), 2)
             if poc_tp_counts
             else 0.0,
+            mean_poc_verified_fps=round(statistics.fmean(poc_fp_counts), 2)
+            if poc_fp_counts
+            else 0.0,
             mean_open_unverified=round(statistics.fmean(open_unverified_counts), 2)
             if open_unverified_counts
+            else 0.0,
+            mean_open_unverified_tps=round(statistics.fmean(unverified_tp_counts), 2)
+            if unverified_tp_counts
+            else 0.0,
+            mean_open_unverified_fps=round(statistics.fmean(unverified_fp_counts), 2)
+            if unverified_fp_counts
             else 0.0,
             mean_harness_limitation=round(statistics.fmean(harness_limitation_counts), 2)
             if harness_limitation_counts
@@ -1141,6 +1185,27 @@ class ScorecardGenerator:
             precision_std=(
                 round(statistics.stdev(precisions) if len(precisions) > 1 else 0.0, 4)
                 if precisions
+                else None
+            ),
+            poc_verified_precision_mean=(
+                round(statistics.fmean(poc_precisions), 4) if poc_precisions else None
+            ),
+            poc_verified_precision_std=(
+                round(statistics.stdev(poc_precisions) if len(poc_precisions) > 1 else 0.0, 4)
+                if poc_precisions
+                else None
+            ),
+            open_unverified_precision_mean=(
+                round(statistics.fmean(unverified_precisions), 4) if unverified_precisions else None
+            ),
+            open_unverified_precision_std=(
+                round(
+                    statistics.stdev(unverified_precisions)
+                    if len(unverified_precisions) > 1
+                    else 0.0,
+                    4,
+                )
+                if unverified_precisions
                 else None
             ),
             precision_medium_plus_mean=(
@@ -1938,7 +2003,15 @@ class ScorecardGenerator:
                     "consistent_open_all_reps": s.consistent_open_all_reps,
                     "saturation_curve": {str(k): v for k, v in sorted(s.saturation_curve.items())},
                     "mean_poc_verified": s.mean_poc_verified,
+                    "mean_poc_verified_tps": s.mean_poc_verified_tps,
+                    "mean_poc_verified_fps": s.mean_poc_verified_fps,
+                    "poc_verified_precision_mean": s.poc_verified_precision_mean,
+                    "poc_verified_precision_std": s.poc_verified_precision_std,
                     "mean_open_unverified": s.mean_open_unverified,
+                    "mean_open_unverified_tps": s.mean_open_unverified_tps,
+                    "mean_open_unverified_fps": s.mean_open_unverified_fps,
+                    "open_unverified_precision_mean": s.open_unverified_precision_mean,
+                    "open_unverified_precision_std": s.open_unverified_precision_std,
                     "mean_harness_limitation": s.mean_harness_limitation,
                     "mean_disproved_by_harness": s.mean_disproved_by_harness,
                     "mean_true_positives": s.mean_true_positives,
@@ -2347,8 +2420,8 @@ class ScorecardGenerator:
                 "\\begin{axis}[",
                 "    width=\\columnwidth,",
                 "    height=5.2cm,",
-                "    xlabel={Cumulative Repetitions ($k$)},",
-                "    ylabel={Expected unique root causes},",
+                "    xlabel={Cumulative repetitions ($k$)},",
+                "    ylabel={Expected unique canonical findings},",
                 "    xtick=data,",
                 "    ymin=0,",
                 "    ymajorgrids=true,",
@@ -2395,8 +2468,8 @@ class ScorecardGenerator:
             *([svg_meta_header] if svg_meta_header else []),
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" font-family="sans-serif">',
             '<rect width="100%" height="100%" fill="#ffffff"/>',
-            f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#111">Cumulative Root-Cause Saturation Curve (N={sat_tier.repetitions}, {repo_name})</text>',
-            f'<text x="18" y="{pad_t + plot_h / 2}" text-anchor="middle" font-size="12" fill="#333" transform="rotate(-90, 18, {pad_t + plot_h / 2})">Expected unique root causes</text>',
+            f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#111">Cumulative Canonical-Finding Saturation Curve (N={sat_tier.repetitions}, {repo_name})</text>',
+            f'<text x="18" y="{pad_t + plot_h / 2}" text-anchor="middle" font-size="12" fill="#333" transform="rotate(-90, 18, {pad_t + plot_h / 2})">Expected unique canonical findings</text>',
         ]
         for y_val in range(0, int(max_y) + 1, step):
             y_px = pad_t + plot_h - (y_val / max_y) * plot_h
@@ -2741,11 +2814,11 @@ class ScorecardGenerator:
     ) -> list[dict]:
         """Collects per-phase mean and SD for uncached_input, cached_input, thoughts, and output tokens across full[<model>] tiers."""
         phases = [
-            ("project_exploration", "Exploration"),
+            ("project_exploration", "Project Expert"),
             ("discovery", "Discovery"),
-            ("deduplication", "Dedup"),
+            ("deduplication", "Dedup."),
             ("initial_review", "Init Review"),
-            ("poc_creation", "PoC Synth."),
+            ("poc_creation", "PoC Creation"),
             ("final_review", "Final Review"),
         ]
         candidate_tiers = [
@@ -2940,11 +3013,11 @@ class ScorecardGenerator:
             return
 
         phases = [
-            ("project_exploration", "Exploration"),
+            ("project_exploration", "Project Expert"),
             ("discovery", "Discovery"),
-            ("deduplication", "Dedup"),
+            ("deduplication", "Dedup."),
             ("initial_review", "Init Review"),
-            ("poc_creation", "PoC Synth."),
+            ("poc_creation", "PoC Creation"),
             ("final_review", "Final Review"),
         ]
         sym_phases = ",".join(label for _, label in phases)

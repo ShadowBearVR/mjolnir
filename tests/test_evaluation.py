@@ -1121,17 +1121,139 @@ class TestEvaluationHarness(unittest.TestCase):
             self.assertEqual(sc_json["refusal_summary"]["total_safety_refusals"], 2)
             self.assertEqual(sc_json["refusal_summary"]["hard_safety_refusals"], 1)
             self.assertEqual(sc_json["refusal_summary"]["api_safety_blocks"], 1)
-            # H6: Saturation plot uses "Expected unique root causes" without "Discover"
+            # H6: Saturation plot uses "Expected unique canonical findings" without "Discover"
             sat_tex = (eval_dir / "plots" / "fig_rq3_saturation_curve.tex").read_text(
                 encoding="utf-8"
             )
             sat_svg = (eval_dir / "plots" / "fig_rq3_saturation_curve.svg").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("Expected unique root causes", sat_tex)
+            self.assertIn("Expected unique canonical findings", sat_tex)
             self.assertNotIn("Discover", sat_tex)
-            self.assertIn("Expected unique root causes", sat_svg)
+            self.assertIn("Expected unique canonical findings", sat_svg)
             self.assertNotIn("Discover", sat_svg)
+
+    def test_h11_poc_vs_unverified_precision_and_module_bazel_lock_ignore(self) -> None:
+        from utilities.worktree_sandbox import WorktreeSandbox
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # 1. Verify WorktreeSandbox ignores MODULE.bazel.lock churn in get_diff, get_modified_files, and gate checks
+            repo_dir = tmp_path / "repo"
+            repo_dir.mkdir()
+            (repo_dir / "MODULE.bazel.lock").write_text('{"CARGO_BAZEL_ISOLATED": "0"}\n')
+            (repo_dir / "src").mkdir()
+            (repo_dir / "src" / "lib.rs").write_text(
+                "pub fn add(a: u32, b: u32) -> u32 { a + b }\n"
+            )
+            (repo_dir / "tests").mkdir()
+            (repo_dir / "tests" / "poc_test.rs").write_text("#[test]\nfn smoke() {}\n")
+
+            ws_dir = tmp_path / "ws"
+            sb = WorktreeSandbox(repo_dir, ws_dir, "VULN-LOCK")
+            sb.setup()
+            try:
+                # Simulate Bazel modifying MODULE.bazel.lock alongside a test file edit
+                sb.write_file("MODULE.bazel.lock", '{"CARGO_BAZEL_ISOLATED": null}\n')
+                sb.write_file("tests/poc_test.rs", "#[test]\nfn smoke() { assert_eq!(1, 1); }\n")
+                self.assertEqual(sb.get_modified_files(), ["tests/poc_test.rs"])
+                self.assertNotIn("MODULE.bazel.lock", sb.get_diff())
+                self.assertEqual(sb.count_removed_baseline_lines(), 0)
+                self.assertFalse(sb.has_production_code_modifications())
+            finally:
+                sb.cleanup()
+
+            # 2. Verify H11: PoC-verified vs unverified open finding TP/FP and precision
+            eval_dir = tmp_path / "eval_h11"
+            eval_dir.mkdir()
+            findings = [
+                {
+                    "id": "v_poc_tp",
+                    "file": "src/a.rs",
+                    "location": "Line 10",
+                    "cwe": "CWE-20",
+                    "severity": "High",
+                    "status": "Open",
+                    "title": "PoC TP",
+                    "description": "PoC TP",
+                    "poc_verified": True,
+                    "history": [
+                        {"phase_id": "poc_creation", "status": "Open", "poc_verified": True}
+                    ],
+                },
+                {
+                    "id": "v_poc_fp",
+                    "file": "src/b.rs",
+                    "location": "Line 20",
+                    "cwe": "CWE-20",
+                    "severity": "Medium",
+                    "status": "Open",
+                    "title": "PoC FP",
+                    "description": "PoC FP",
+                    "poc_verified": True,
+                    "history": [
+                        {"phase_id": "poc_creation", "status": "Open", "poc_verified": True}
+                    ],
+                },
+                {
+                    "id": "v_unver_fp",
+                    "file": "src/c.rs",
+                    "location": "Line 30",
+                    "cwe": "CWE-20",
+                    "severity": "Medium",
+                    "status": "Open",
+                    "title": "Unver FP",
+                    "description": "Unver FP",
+                    "poc_verified": False,
+                    "history": [
+                        {"phase_id": "poc_creation", "status": "Open", "poc_verified": False}
+                    ],
+                },
+            ]
+            t_rec = TrialRunRecord(
+                project_name="OpenPRoT",
+                repo_name="openprot",
+                pinned_rev="abc1234",
+                target_dir="services",
+                ablation_tier="full",
+                tier_name="Mjolnir Full",
+                model="gemini-3.8-flash",
+                repetition=1,
+                wall_clock_seconds=10.0,
+                total_tokens=1000,
+                open_findings_count=3,
+                poc_verified_count=2,
+                findings=findings,
+            )
+            (eval_dir / "trials_manifest.json").write_text(
+                json.dumps([t_rec.model_dump()], indent=2), encoding="utf-8"
+            )
+            pool, _ = FindingPooler().build_pool([t_rec], eval_dir)
+            for cf in pool:
+                lbl = "TP" if cf.file == "src/a.rs" else "FP"
+                cf.reviewer_1_label = lbl
+                cf.reviewer_2_label = lbl
+            (eval_dir / "blind_review_pool.json").write_text(
+                json.dumps([c.model_dump() for c in pool], indent=2), encoding="utf-8"
+            )
+            summaries = ScorecardGenerator().generate_scorecard(eval_dir)
+            s = summaries[0]
+            self.assertEqual(s.mean_poc_verified_tps, 1.0)
+            self.assertEqual(s.mean_poc_verified_fps, 1.0)
+            self.assertEqual(s.poc_verified_precision_mean, 0.5)
+            self.assertEqual(s.mean_open_unverified_tps, 0.0)
+            self.assertEqual(s.mean_open_unverified_fps, 1.0)
+            self.assertEqual(s.open_unverified_precision_mean, 0.0)
+            meta = json.loads(
+                (eval_dir / "tables" / "tables_metadata.json").read_text(encoding="utf-8")
+            )
+            ts = meta["tiers_summary"][0]
+            self.assertEqual(ts["mean_poc_verified_tps"], 1.0)
+            self.assertEqual(ts["mean_poc_verified_fps"], 1.0)
+            self.assertEqual(ts["poc_verified_precision_mean"], 0.5)
+            self.assertEqual(ts["mean_open_unverified_tps"], 0.0)
+            self.assertEqual(ts["mean_open_unverified_fps"], 1.0)
+            self.assertEqual(ts["open_unverified_precision_mean"], 0.0)
 
 
 if __name__ == "__main__":
