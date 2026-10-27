@@ -18,6 +18,7 @@ from utilities.logger import logger
 
 GITHUB_REPO_URLS: dict[str, str] = {
     "caliptra-sw": "https://github.com/chipsalliance/caliptra-sw",
+    "caliptra-sw-v210": "https://github.com/chipsalliance/caliptra-sw",
     "caliptra-mcu-sw": "https://github.com/chipsalliance/caliptra-mcu-sw",
     "caliptra-dpe": "https://github.com/chipsalliance/caliptra-dpe",
     "opentitan": "https://github.com/lowRISC/opentitan",

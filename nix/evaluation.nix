@@ -8,6 +8,7 @@ let
     project = {
       inherit (evalCfg) name repoName repoUrl pinnedRev;
       nixSourcePath = if evalCfg ? src && evalCfg.src != null then "${evalCfg.src}" else null;
+      cveGroundTruth = if evalCfg ? cveGroundTruth && evalCfg.cveGroundTruth != null then "${evalCfg.cveGroundTruth}" else null;
       targetDir = evalCfg.targetDir or null;
       threatModel = evalCfg.threatModel or null;
       evaluatorModel = evalCfg.evaluatorModel or "gemini-3.8-flash";

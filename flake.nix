@@ -174,6 +174,11 @@
             devShell = caliptraSwShell;
           };
 
+          eval-caliptra-sw-v210 = makeEvaluation {
+            evaluation = import ./evaluations/projects/caliptra-sw-v210/eval.nix;
+            devShell = caliptraSwShell;
+          };
+
           eval-caliptra-mcu-sw = makeEvaluation {
             evaluation = import ./evaluations/projects/caliptra-mcu-sw/eval.nix;
             devShell = caliptraSwShell;
@@ -367,6 +372,7 @@
               mjolnir-app
               evaluation-app
               eval-caliptra-sw
+              eval-caliptra-sw-v210
               eval-caliptra-mcu-sw
               eval-caliptra-dpe
               eval-opentitan

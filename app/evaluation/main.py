@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from evaluation.constants import ABLATION_TIERS
+from evaluation.cve_recall import CveRecallEvaluator
 from evaluation.grader import FindingPooler
 from evaluation.models import TrialRunRecord
 from evaluation.scorecard import ScorecardGenerator
@@ -166,6 +167,25 @@ def main() -> None:
         help="Optional path to verbatim project threat_model.md",
     )
 
+    # 7. score-cve-recall subcommand
+    cve_parser = subparsers.add_parser(
+        "score-cve-recall",
+        help="Evaluate trial and checkpoint recall against a Known-CVE ground-truth manifest",
+    )
+    cve_parser.add_argument(
+        "--eval-dir",
+        required=True,
+        help="Evaluation output directory or trials_manifest.json path",
+    )
+    cve_parser.add_argument(
+        "--ground-truth",
+        help="Path to cve_ground_truth.json (defaults to spec.project.cveGroundTruth if configured)",
+    )
+    cve_parser.add_argument(
+        "--output-dir",
+        help="Optional output directory for cve_recall_{results.json,scorecard.md,table.tex}",
+    )
+
     args = parser.parse_args()
 
     spec: dict = {}
@@ -211,6 +231,12 @@ def main() -> None:
         if trials:
             eval_dir = output_root / spec["project"]["repoName"] / args.run_label
             ScorecardGenerator().generate_scorecard(eval_dir)
+            gt_cfg = spec.get("project", {}).get("cveGroundTruth")
+            if gt_cfg and Path(gt_cfg).exists():
+                CveRecallEvaluator().evaluate_and_write(
+                    eval_dir=eval_dir,
+                    ground_truth_path=Path(gt_cfg),
+                )
     elif args.subcommand == "pool":
         eval_dir = Path(args.eval_dir)
         manifest_path = eval_dir if eval_dir.is_file() else eval_dir / "trials_manifest.json"
@@ -250,6 +276,19 @@ def main() -> None:
             eval_dir=eval_dir,
             out_path=eval_dir / "blind_review" / "pass2_poc_deck.json",
             threat_model_path=tm_path,
+        )
+    elif args.subcommand == "score-cve-recall":
+        gt_raw = args.ground_truth or spec.get("project", {}).get("cveGroundTruth")
+        if not gt_raw:
+            sys.stderr.write(
+                "Error: --ground-truth is required when spec.project.cveGroundTruth is not set\n"
+            )
+            sys.exit(1)
+        out_dir = Path(args.output_dir) if args.output_dir else None
+        CveRecallEvaluator().evaluate_and_write(
+            eval_dir=Path(args.eval_dir),
+            ground_truth_path=Path(gt_raw),
+            output_dir=out_dir,
         )
 
 
