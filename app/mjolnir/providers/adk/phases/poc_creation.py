@@ -58,12 +58,18 @@ def _assemble_ground_truth_poc_bundle(
     # 3. No baseline lines were deleted or modified.
     # 4. No production code files were altered (only test/harness code).
     has_test_execution = bool(sandbox.command_history)
+    agent_claimed_verified = bool(finding.poc_verified)
+    gate_rejected = False
 
     if finding.poc_verified:
         if not actual_diff or not has_test_execution or removed_baseline_lines > 0 or prod_modified:
             finding.poc_verified = False
+            gate_rejected = True
 
-    status_lines = []
+    status_lines = [
+        f"- **Pre-Gate Agent Claimed `poc_verified`**: `{agent_claimed_verified}`",
+        f"- **Mechanical Gate Rejected**: `{gate_rejected}`",
+    ]
     if getattr(finding, "cwe", None):
         status_lines.append(f"- **MITRE CWE**: `{finding.cwe}`")
     if getattr(finding, "attack_boundary", None):
@@ -131,6 +137,8 @@ async def poc_creation_phase(
     phase_id = PHASE_POC_CREATION_ID
     phase_name = PHASE_POC_CREATION_NAME
     logger.info(f"Starting {phase_name} ({phase_id})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(phase_id)
 
     vulnerabilities = (
         node_input if isinstance(node_input, list) else list(ctx.state.get("vulnerabilities", []))
@@ -169,7 +177,9 @@ async def poc_creation_phase(
                     f"Skipped: Severity ({v.severity.value}) is below minimum PoC threshold ({min_poc_severity}).",
                 )
         ctx.state["vulnerabilities"] = vulnerabilities
-        checkpoint_audit_findings(ctx, vulnerabilities, phase_id)
+        await checkpoint_audit_findings(
+            vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
+        )
         return vulnerabilities
 
     exploiter_tools = get_exploiter_tools(enable_project_expert=enable_project_expert)

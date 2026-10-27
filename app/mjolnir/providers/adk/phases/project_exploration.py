@@ -91,6 +91,8 @@ async def project_exploration_phase(ctx: Context, node_input: Any = None) -> Any
     the exploration summary in session state for downstream agents and `ask_project_expert`.
     """
     logger.info(f"Starting {PHASE_EXPLORATION_NAME} ({PHASE_EXPLORATION_ID})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(PHASE_EXPLORATION_ID)
 
     model = ctx.state["model"]
     code_dir = ctx.state["code_dir"]

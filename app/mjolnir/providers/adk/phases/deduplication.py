@@ -91,6 +91,8 @@ async def deduplication_phase(ctx: Context, node_input: Any = None) -> list[Vuln
     phase_id = PHASE_DEDUPLICATION_ID
     phase_name = PHASE_DEDUPLICATION_NAME
     logger.info(f"Starting {phase_name} ({phase_id})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(phase_id)
 
     raw_vulns = (
         node_input if isinstance(node_input, list) else list(ctx.state.get("vulnerabilities", []))

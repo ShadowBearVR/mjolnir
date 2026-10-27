@@ -59,6 +59,8 @@ async def _try_fast_json_ingestion(full_path: Path) -> list[Vulnerability] | Non
 async def ingest_report_phase(ctx: Context, node_input: str | None = None) -> list[Vulnerability]:
     """Ingests and parses unstructured security report findings using tool delegation."""
     logger.info(f"Starting {PHASE_INGEST_NAME} ({PHASE_INGEST_ID}): Parsing report document(s)...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(PHASE_DISCOVERY_ID)
 
     report_file_path = (
         node_input

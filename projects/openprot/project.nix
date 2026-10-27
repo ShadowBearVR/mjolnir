@@ -10,6 +10,7 @@
 
   defaultModel = "gemini-3.8-flash";
   defaultRef = "main";
+  defaultMode = "full";
   defaultBatchSize = 64;
   defaultExtensions = [ "rs" "c" "h" ];
 }

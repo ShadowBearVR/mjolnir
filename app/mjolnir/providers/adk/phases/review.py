@@ -42,6 +42,8 @@ async def _run_review_pass(
 ) -> list[Vulnerability]:
     """Shared adversarial review engine for both Initial Review (pre-PoC) and Final Review (with PoC)."""
     logger.info(f"Starting {phase_name} ({phase_id})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(phase_id)
 
     vulnerabilities = (
         node_input if isinstance(node_input, list) else list(ctx.state.get("vulnerabilities", []))
@@ -64,7 +66,6 @@ async def _run_review_pass(
     ]
     has_eligible = any(
         getattr(v, "status", Status.OPEN) == Status.OPEN
-        and (not evaluate_poc or bool(v.poc))
         and not (not evaluate_poc and any(h.phase_id == phase_id for h in v.history))
         for v in vulnerabilities
     )
@@ -74,10 +75,10 @@ async def _run_review_pass(
                 continue
             if getattr(v, "status", Status.OPEN) != Status.OPEN:
                 v.add_skipped(phase_id, phase_name, f"Skipped: Status is {v.status}")
-            else:
-                v.add_skipped(phase_id, phase_name, "Skipped: No PoC generated for this finding.")
         ctx.state["vulnerabilities"] = vulnerabilities
-        checkpoint_audit_findings(ctx, vulnerabilities, phase_id)
+        await checkpoint_audit_findings(
+            vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
+        )
         return vulnerabilities
 
     reviewer_tools = get_reviewer_tools(enable_project_expert=enable_project_expert)
@@ -115,18 +116,14 @@ async def _run_review_pass(
             if not evaluate_poc and any(h.phase_id == phase_id for h in vuln.history):
                 return vuln
 
-            if evaluate_poc and not vuln.poc:
-                vuln.add_skipped(
-                    phase_id,
-                    phase_name,
-                    "Skipped: No PoC generated for this finding.",
-                )
-                return vuln
-
             exclude_fields = set() if evaluate_poc else {"poc"}
             finding_payload = vuln.model_dump_json(indent=2, exclude=exclude_fields)
-            if evaluate_poc and vuln.poc:
-                poc_content = vuln.poc
+            if evaluate_poc:
+                poc_content = (
+                    vuln.poc
+                    if vuln.poc
+                    else "[NO POC GENERATED — Dynamic verification test synthesis did not produce a test artifact; perform final adversarial static verification directly against the codebase and threat model.]"
+                )
                 if len(poc_content) > MAX_REVIEW_POC_PROMPT_CHARS:
                     half = MAX_REVIEW_POC_PROMPT_CHARS // 2
                     poc_content = (

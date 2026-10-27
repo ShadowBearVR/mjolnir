@@ -104,9 +104,17 @@ BUILD_CONFIGURATION_FILES = frozenset(
         "cargo.lock",
         "build",
         "build.bazel",
+        "module.bazel.lock",
         "cmakelists.txt",
         "makefile",
     }
+)
+
+SANDBOX_GIT_DIFF_EXCLUDES = (
+    ":!.mjolnir_tags*",
+    ":!tags*",
+    ":!MODULE.bazel.lock",
+    ":!**/MODULE.bazel.lock",
 )
 
 SANDBOX_ALLOWED_ENV_VARS = frozenset(
@@ -284,8 +292,9 @@ DEDUPLICATION_TASK_PROMPT_TEMPLATE = """Evaluate candidate vulnerabilities from 
 Produce a DeduplicationReport declaring whether each candidate finding duplicates an existing canonical finding or is unique."""
 
 POC_CREATION_TASK_PROMPT_TEMPLATE = (
-    "Synthesize and execute a Proof-of-Concept (PoC) unit test in your isolated "
-    "sandbox to verify the following security finding:\n\n"
+    "Write and execute a defensive security regression test or simulation testbench check "
+    "in your isolated workspace sandbox to verify whether the following static audit finding "
+    "is genuinely reachable:\n\n"
     "{finding_payload}"
 )
 POC_VERIFICATION_STATUS_SECTION_TEMPLATE = (

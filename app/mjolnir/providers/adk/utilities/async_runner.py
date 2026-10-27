@@ -39,6 +39,30 @@ def extract_agent_output(res: Any, expected_schema: Any) -> Any:
             logger.warning(f"Failed to validate JSON output against {expected_schema}: {e}")
 
 
+SAFETY_REFUSAL_MARKERS = (
+    "cannot fulfill your request",
+    "cannot fulfill this request",
+    "unable to fulfill",
+    "cannot assist",
+    "adhere to the strict refusal",
+    "adhere to the strictest safety",
+    "must refuse",
+    "refusal justification",
+    "prevent real-world harm",
+    "i cannot provide",
+    "sorry, i cannot",
+    "safety policy",
+    "prohibits generating",
+    "unable to generate functional exploit",
+)
+
+
+def is_safety_refusal_text(text: str) -> bool:
+    """Checks whether plain-text or reasoning output indicates a model safety policy refusal."""
+    low = (text or "").lower()
+    return any(marker in low for marker in SAFETY_REFUSAL_MARKERS)
+
+
 def track_soft_refusal(ctx: Any, result: Any, agent_name: str, target_id: str) -> Optional[str]:
     """Checks a structured agent result for `refusal_reason`, logging and recording it in UsageTracker."""
     refusal_reason = getattr(result, "refusal_reason", None)
@@ -48,6 +72,8 @@ def track_soft_refusal(ctx: Any, result: Any, agent_name: str, target_id: str) -
     logger.warning(f"{agent_name} soft refusal on '{target_id}': {refusal_reason}")
     tracker = ctx.state.get("usage_tracker")
     if tracker:
+        if hasattr(tracker, "track_refusal"):
+            tracker.track_refusal("soft_refusals", agent_name=agent_name)
         tracker.track_error(
             ValueError(f"SoftRefusal: {refusal_reason}"),
             agent_name,
@@ -74,15 +100,34 @@ async def run_agent_node(
         extracted = extract_agent_output(res, expected_schema) if expected_schema else res
         if expected_schema and extracted is None and res is not None:
             schema_name = getattr(expected_schema, "__name__", str(expected_schema))
-            logger.warning(
-                f"Agent {agent.name} output failed validation against {schema_name} for {run_id}"
-            )
             tracker = ctx.state.get("usage_tracker")
-            if tracker:
-                tracker.track_error(
-                    ValueError(f"SchemaValidationError: {schema_name}"),
-                    agent.name,
+            raw_txt = extract_agent_text(res)
+            log_joined = ""
+            if tracker and hasattr(tracker, "reasoning_log"):
+                entries = tracker.reasoning_log.get(run_id, [])
+                log_joined = " ".join(str(e.get("content", "")) for e in entries)
+            if is_safety_refusal_text(f"{raw_txt} {log_joined}"):
+                logger.warning(
+                    f"Agent {agent.name} hard safety refusal against {schema_name} for {run_id}"
                 )
+                if tracker:
+                    if hasattr(tracker, "track_refusal"):
+                        tracker.track_refusal("hard_safety_refusals", agent_name=agent.name)
+                    tracker.track_error(
+                        ValueError(f"HardSafetyRefusal: {schema_name}"),
+                        agent.name,
+                    )
+            else:
+                logger.warning(
+                    f"Agent {agent.name} output failed validation against {schema_name} for {run_id}"
+                )
+                if tracker:
+                    if hasattr(tracker, "track_refusal"):
+                        tracker.track_refusal("schema_validation_drops", agent_name=agent.name)
+                    tracker.track_error(
+                        ValueError(f"SchemaValidationError: {schema_name}"),
+                        agent.name,
+                    )
         elif extracted is not None:
             track_soft_refusal(ctx, extracted, agent.name, run_id)
         return extracted

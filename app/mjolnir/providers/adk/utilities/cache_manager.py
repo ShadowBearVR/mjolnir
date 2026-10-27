@@ -96,11 +96,11 @@ class PhaseContextCache:
             return self.cache_name
         except Exception as e:
             err_str = str(e)
-            if "minimum token count" in err_str or "INVALID_ARGUMENT" in err_str:
+            if "minimum token count" in err_str.lower() or "too small" in err_str.lower():
                 logger.debug(f"Explicit context caching skipped (below token threshold): {e}")
             else:
                 logger.info(
-                    f"Explicit context caching skipped ({e}). Proceeding with standard inference."
+                    f"Explicit context caching skipped for {self.model} ({e}). Proceeding with standard inference."
                 )
             self.cache_name = None
             return None

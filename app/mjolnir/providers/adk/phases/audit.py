@@ -67,6 +67,8 @@ async def checkpoint_audit_findings(
 async def discovery_phase(ctx: Context, node_input: list[str] | None = None) -> list[Vulnerability]:
     """Dynamic File Auditing (Discovery) Phase."""
     logger.info(f"Starting {PHASE_DISCOVERY_NAME} ({PHASE_DISCOVERY_ID})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(PHASE_DISCOVERY_ID)
 
     target_files = node_input if isinstance(node_input, list) else list(ctx.state.get("files", []))
     model = ctx.state["model"]
