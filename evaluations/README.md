@@ -54,15 +54,19 @@ nix run .#eval-caliptra-sw -- scorecard \
   --eval-dir ./test-out/evaluations/caliptra-sw/pinned
 ```
 
-## Historical Known-CVE Recall Experiment (`caliptra-sw @ fw-2.1.0`)
+## Stratified Security Baseline & Historical CVE Recall (`caliptra-sw @ fw-2.1.0`)
 
-`evaluations/projects/caliptra-sw-v210/` pins `chipsalliance/caliptra-sw` at release tag `fw-2.1.0` (`7da3b01b8b1806af0ec491c5e3e3e7cac91a3561`, `2026-03-10`) across all 10 on-target Caliptra Core RISC-V firmware crates (`202` non-test `.rs` files) to measure pipeline recall against the 5 publicly disclosed 2026 CVEs (`CVE-2026-5818`, `CVE-2026-6458`, `CVE-2026-7328`, `CVE-2026-11835`, `CVE-2026-11836`):
+`evaluations/projects/caliptra-sw-v210/` pins `chipsalliance/caliptra-sw` at release tag `fw-2.1.0` (`7da3b01b8b1806af0ec491c5e3e3e7cac91a3561`, `2026-03-10`) across all 10 on-target Caliptra Core RISC-V firmware crates (`202` non-test `.rs` files) and evaluates pipeline recall against a complete 36-item post-`fw-2.1.0` Stratified Security Baseline (`SECURITY_BASELINE.md` and `cve_ground_truth.json`, covering all `295` upstream commits merged through `2026-10-27`):
+
+- **Tier A (`5` Published CVEs / GHSAs)**: `CVE-2026-5818`, `CVE-2026-6458`, `CVE-2026-7328`, `CVE-2026-11835`, `CVE-2026-11836`
+- **Tier B (`22` Maintainer Security Bugs, `SB-01`..`SB-22`)**: Auth/access-control bypasses, mailbox privilege checks, integer overflows, and PQC/protocol verification bugs patched upstream without separate CVE IDs (`Core Security Bugs = Tier A + B = 27 items`)
+- **Tier C (`9` Zeroization, Attestation & Side-Channel Hardening Fixes, `SH-01`..`SH-09`)**: Secret zeroization, attestation completeness, and fault/timing hardening PRs (`Complete Baseline = Tier A–C = 36 items`)
 
 ```bash
-# Run 1-repetition full scan on gemini-3.8-flash and emit cve_recall_{results.json,scorecard.md,table.tex}
+# Run 1-repetition full scan on gemini-3.8-flash and emit stratified cve_recall_{results.json,scorecard.md,table.tex}
 nix run .#eval-caliptra-sw-v210
 
-# Re-score CVE recall against trials_manifest.json at any time
+# Re-score stratified Tier A–C recall against trials_manifest.json at any time
 nix run .#eval-caliptra-sw-v210 -- score-cve-recall \
   --eval-dir ./test-out/evaluations/caliptra-sw-v210/pinned
 ```

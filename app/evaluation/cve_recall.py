@@ -1,11 +1,17 @@
 # Licensed under the Apache-2.0 license
 # SPDX-License-Identifier: Apache-2.0
-"""Known-CVE Ground-Truth Recall Evaluator for Historical Pinned Snapshots.
+"""Stratified Ground-Truth Security Baseline & Known-CVE Recall Evaluator.
+
+Supports three stratified upstream ground-truth tiers on historical pinned snapshots:
+- Tier A: Published CVEs / GitHub Security Advisories
+- Tier B: Maintainer-patched exploitable firmware security bugs (without separate CVE IDs)
+- Tier C: Secret zeroization, attestation completeness, and side-channel/fault hardening fixes
 
 Security Architecture Note:
 - Processes local evaluation JSON artifacts strictly via `json.loads` and Pydantic models
   (no insecure deserialization, `eval`, `exec`, or shell execution).
-- Validates and canonicalizes filesystem paths via `Path.resolve()` before reading or writing.
+- Validates external reference URLs against an explicit `https://github.com/` / `https://nvd.nist.gov/`
+  allow-list and canonicalizes filesystem paths via `Path.resolve()`.
 - TODO(security): Web-specific controls (HTTP cookies, sessions, OAuth/MFA, CSRF, CSP,
   SQL parameterization, and multipart file-upload scanning) are intentionally omitted
   because this module is a pure offline local CLI evaluator with no network or DB surface.
@@ -14,20 +20,25 @@ Security Architecture Note:
 import json
 from pathlib import Path
 import re
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from evaluation.models import TrialRunRecord
 from utilities.logger import logger
 
 LINE_TOLERANCE_DEFAULT = 30
+_ALLOWED_URL_PREFIXES = (
+    "https://github.com/",
+    "https://nvd.nist.gov/",
+)
 
 _LINE_RANGE_RE = re.compile(r"(?:lines?|l)\s*(\d+)(?:\s*[-–:]\s*(\d+))?", re.IGNORECASE)
 _COLON_LINE_RE = re.compile(r":(\d+)(?:-(\d+))?")
 
 
 class CveSiteSpec(BaseModel):
-    """Source file and function/line location for a vulnerable site of a known CVE."""
+    """Source file and function/line location for a vulnerable site of a baseline item."""
 
     site_id: str
     file: str
@@ -37,23 +48,44 @@ class CveSiteSpec(BaseModel):
 
 
 class KnownCveSpec(BaseModel):
-    """Ground-truth specification for a publicly disclosed historical CVE."""
+    """Ground-truth specification for a historical CVE or upstream-patched security bug."""
 
     cve_id: str
+    tier: Literal["A", "B", "C"] = "A"
+    category: str = ""
     ghsa_id: str = ""
+    advisory_url: str = ""
     severity: str
     cwe: str = ""
     published_date: str = ""
+    release_tag: str = ""
     fix_pr: int | None = None
+    fix_pr_url: str = ""
+    additional_prs: list[int] = Field(default_factory=list)
     fix_commit: str = ""
+    fix_commit_url: str = ""
     title: str
     summary: str
     sites: list[CveSiteSpec]
     concept_groups: list[list[str]] = Field(default_factory=list)
 
+    @field_validator("advisory_url", "fix_pr_url", "fix_commit_url")
+    @classmethod
+    def _validate_reference_url(cls, val: str) -> str:
+        clean = str(val or "").strip()
+        if not clean:
+            return ""
+        if not clean.startswith(_ALLOWED_URL_PREFIXES):
+            raise ValueError(
+                f"Reference URL must start with one of {_ALLOWED_URL_PREFIXES}: {clean}"
+            )
+        if any(ch in clean for ch in (" ", "\n", "\r", "\t", '"', "<", ">", ")")):
+            raise ValueError(f"Unsafe character in reference URL: {clean}")
+        return clean
+
 
 class CveGroundTruthManifest(BaseModel):
-    """Top-level ground-truth manifest for a historical CVE-recall benchmark."""
+    """Top-level ground-truth manifest for a historical security-recall benchmark."""
 
     benchmark_id: str
     project_name: str
@@ -67,7 +99,7 @@ class CveGroundTruthManifest(BaseModel):
 
 
 class MatchedFindingSummary(BaseModel):
-    """Concise summary of a Mjolnir finding matching a ground-truth CVE."""
+    """Concise summary of a Mjolnir finding matching a ground-truth item."""
 
     finding_id: str
     site_id: str
@@ -80,10 +112,11 @@ class MatchedFindingSummary(BaseModel):
 
 
 class PerCveTrialResult(BaseModel):
-    """Per-CVE recall outcome within a single trial or pipeline checkpoint."""
+    """Per-item recall outcome within a single trial or pipeline checkpoint."""
 
     cve_id: str
-    ghsa_id: str
+    tier: Literal["A", "B", "C"] = "A"
+    ghsa_id: str = ""
     severity: str
     detected_any_status: bool
     detected_open: bool
@@ -94,8 +127,19 @@ class PerCveTrialResult(BaseModel):
     same_file_unmatched: list[MatchedFindingSummary] = Field(default_factory=list)
 
 
+class TierRecallBreakdown(BaseModel):
+    """Stratified X/N recall breakdown for a subset of baseline tiers."""
+
+    tier_key: str
+    label: str
+    total: int
+    recalled_any_status: int
+    recalled_open: int
+    recalled_poc_verified: int
+
+
 class TrialCveRecallSummary(BaseModel):
-    """Aggregate X/N CVE recall summary for a single trial or checkpoint record."""
+    """Aggregate and tier-stratified recall summary for a single trial or checkpoint."""
 
     ablation_tier: str
     tier_name: str
@@ -107,11 +151,12 @@ class TrialCveRecallSummary(BaseModel):
     recalled_open: int
     recalled_poc_verified: int
     total_open_findings: int
+    by_tier: dict[str, TierRecallBreakdown] = Field(default_factory=dict)
     per_cve: list[PerCveTrialResult]
 
 
 class CveRecallReport(BaseModel):
-    """Complete structured CVE-recall output written to cve_recall_results.json."""
+    """Complete structured recall output written to cve_recall_results.json."""
 
     benchmark_id: str
     project_name: str
@@ -119,6 +164,32 @@ class CveRecallReport(BaseModel):
     pinned_rev: str
     contamination_disclosure: str
     trials: list[TrialCveRecallSummary]
+
+
+_STRATA_DEFINITIONS: tuple[tuple[str, str, set[str]], ...] = (
+    ("A", "Tier A — Published CVEs", {"A"}),
+    ("B", "Tier B — Maintainer Security Bugs", {"B"}),
+    ("A+B", "Core Security Bugs (Tier A + B)", {"A", "B"}),
+    ("C", "Tier C — Zeroization & Hardening", {"C"}),
+    ("A+B+C", "Complete Security Baseline (Tier A–C)", {"A", "B", "C"}),
+)
+
+
+def _compute_tier_breakdowns(
+    per_cve_results: list[PerCveTrialResult],
+) -> dict[str, TierRecallBreakdown]:
+    out: dict[str, TierRecallBreakdown] = {}
+    for key, label, allowed_tiers in _STRATA_DEFINITIONS:
+        subset = [r for r in per_cve_results if r.tier in allowed_tiers]
+        out[key] = TierRecallBreakdown(
+            tier_key=key,
+            label=label,
+            total=len(subset),
+            recalled_any_status=sum(1 for r in subset if r.detected_any_status),
+            recalled_open=sum(1 for r in subset if r.detected_open),
+            recalled_poc_verified=sum(1 for r in subset if r.detected_poc_verified),
+        )
+    return out
 
 
 def _normalize_repo_rel_path(raw_path: str) -> str:
@@ -242,8 +313,24 @@ def _resolve_safe_path(raw_path: Path) -> Path:
     return raw_path.expanduser().resolve()
 
 
+def _format_ref_links(meta: KnownCveSpec) -> str:
+    parts: list[str] = []
+    if meta.ghsa_id and meta.advisory_url:
+        parts.append(f"[{meta.ghsa_id}]({meta.advisory_url})")
+    elif meta.ghsa_id:
+        parts.append(f"`{meta.ghsa_id}`")
+    if meta.fix_pr and meta.fix_pr_url:
+        parts.append(f"[PR #{meta.fix_pr}]({meta.fix_pr_url})")
+    elif meta.fix_pr:
+        parts.append(f"PR #{meta.fix_pr}")
+    parts.append(meta.severity)
+    if meta.cwe:
+        parts.append(meta.cwe)
+    return ", ".join(parts)
+
+
 class CveRecallEvaluator:
-    """Evaluates Mjolnir trial records against a declarative Known-CVE ground-truth manifest."""
+    """Evaluates Mjolnir trial records against a declarative stratified security baseline."""
 
     def __init__(self, line_tolerance: int = LINE_TOLERANCE_DEFAULT) -> None:
         self.line_tolerance = line_tolerance
@@ -313,6 +400,7 @@ class CveRecallEvaluator:
                 per_cve_results.append(
                     PerCveTrialResult(
                         cve_id=cve.cve_id,
+                        tier=cve.tier,
                         ghsa_id=cve.ghsa_id,
                         severity=cve.severity,
                         detected_any_status=det_any,
@@ -326,6 +414,7 @@ class CveRecallEvaluator:
                 )
 
             open_count = sum(1 for nf in norm_findings if nf["status"].lower() == "open")
+            tier_breakdowns = _compute_tier_breakdowns(per_cve_results)
             summaries.append(
                 TrialCveRecallSummary(
                     ablation_tier=trial.ablation_tier,
@@ -340,6 +429,7 @@ class CveRecallEvaluator:
                         1 for r in per_cve_results if r.detected_poc_verified
                     ),
                     total_open_findings=open_count,
+                    by_tier=tier_breakdowns,
                     per_cve=per_cve_results,
                 )
             )
@@ -358,91 +448,157 @@ class CveRecallEvaluator:
         report: CveRecallReport,
         ground_truth: CveGroundTruthManifest,
     ) -> str:
+        n_a = sum(1 for c in ground_truth.cves if c.tier == "A")
+        n_b = sum(1 for c in ground_truth.cves if c.tier == "B")
+        n_c = sum(1 for c in ground_truth.cves if c.tier == "C")
+
         lines: list[str] = [
-            f"# Historical Known-CVE Recall Scorecard: {report.project_name} (`{report.pinned_tag}`)",
+            f"# Stratified Security Baseline & CVE Recall Scorecard: {report.project_name} (`{report.pinned_tag}`)",
             "",
             f"- **Pinned Revision**: `{report.pinned_rev}` (`{ground_truth.upstream_repo}` @ `{report.pinned_tag}`, `{ground_truth.pinned_date}`)",
-            f"- **Ground-Truth Benchmark**: `{report.benchmark_id}` ({len(ground_truth.cves)} published CVEs)",
+            (
+                f"- **Ground-Truth Benchmark**: `{report.benchmark_id}` "
+                f"(`{len(ground_truth.cves)}` total items: Tier A = `{n_a}` CVEs, "
+                f"Tier B = `{n_b}` security bugs, Tier C = `{n_c}` hardening fixes)"
+            ),
         ]
         if report.contamination_disclosure:
             lines.append(f"- **Contamination Disclosure**: {report.contamination_disclosure}")
         lines.append("")
 
-        cve_ids = [c.cve_id for c in ground_truth.cves]
-        header = (
-            "| Tier / Checkpoint | Rep | Model | Open Recall | PoC-Verified | Total Open | "
-            + " | ".join(f"`{cid}`" for cid in cve_ids)
-            + " |"
+        # Section 1: Stratified Tier Recall Matrix
+        lines.extend(
+            [
+                "## 1. Stratified Recall Across Baseline Tiers (Open / PoC-Verified)",
+                "",
+                "| Tier / Checkpoint | Rep | Model | Total Open | Tier A CVEs (Open / PoC) | Tier B Bugs (Open / PoC) | Core A+B (Open / PoC) | Tier C Hardening (Open / PoC) | All A–C (Open / PoC) |",
+                "| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+            ]
         )
-        sep = (
-            "| :--- | :---: | :--- | :---: | :---: | :---: | "
-            + " | ".join(":---:" for _ in cve_ids)
-            + " |"
-        )
-        lines.extend(["## 1. Per-Trial & Pipeline-Checkpoint Recall Matrix", "", header, sep])
-
         for t in report.trials:
-            by_id = {r.cve_id: r for r in t.per_cve}
-            cells: list[str] = []
-            for cid in cve_ids:
-                r = by_id[cid]
-                if r.detected_poc_verified:
-                    badge = "OPEN+PoC"
-                elif r.detected_open:
-                    badge = "OPEN"
-                elif r.detected_any_status:
-                    badge = "Closed/Dup"
-                else:
-                    badge = "MISS"
-                if r.total_sites > 1 and r.detected_open:
-                    badge += f" ({len(r.matched_site_ids_open)}/{r.total_sites})"
-                cells.append(badge)
-
+            bt = t.by_tier
+            ta = bt["A"]
+            tb = bt["B"]
+            tab = bt["A+B"]
+            tc = bt["C"]
+            tall = bt["A+B+C"]
             lines.append(
-                f"| `{t.ablation_tier}` | {t.repetition} | `{t.model}` | "
-                f"**{t.recalled_open}/{t.total_cves}** | {t.recalled_poc_verified}/{t.total_cves} | "
-                f"{t.total_open_findings} | " + " | ".join(cells) + " |"
+                f"| `{t.ablation_tier}` | {t.repetition} | `{t.model}` | {t.total_open_findings} | "
+                f"**{ta.recalled_open}/{ta.total}** ({ta.recalled_poc_verified} PoC) | "
+                f"**{tb.recalled_open}/{tb.total}** ({tb.recalled_poc_verified} PoC) | "
+                f"**{tab.recalled_open}/{tab.total}** ({tab.recalled_poc_verified} PoC) | "
+                f"{tc.recalled_open}/{tc.total} ({tc.recalled_poc_verified} PoC) | "
+                f"**{tall.recalled_open}/{tall.total}** ({tall.recalled_poc_verified} PoC) |"
             )
 
-        lines.extend(["", "## 2. Per-CVE Matched Findings (Primary Non-Checkpoint Trials)", ""])
+        # Section 2: Tier A Per-CVE Matrix
+        tier_a_ids = [c.cve_id for c in ground_truth.cves if c.tier == "A"]
+        if tier_a_ids:
+            header = (
+                "| Tier / Checkpoint | Rep | Model | Tier A Open | Tier A PoC | Total Open | "
+                + " | ".join(f"`{cid}`" for cid in tier_a_ids)
+                + " |"
+            )
+            sep = (
+                "| :--- | :---: | :--- | :---: | :---: | :---: | "
+                + " | ".join(":---:" for _ in tier_a_ids)
+                + " |"
+            )
+            lines.extend(
+                ["", "## 2. Tier A — Published CVEs Per-Checkpoint Matrix", "", header, sep]
+            )
+
+            for t in report.trials:
+                by_id = {r.cve_id: r for r in t.per_cve}
+                ta = t.by_tier["A"]
+                cells: list[str] = []
+                for cid in tier_a_ids:
+                    r = by_id[cid]
+                    if r.detected_poc_verified:
+                        badge = "OPEN+PoC"
+                    elif r.detected_open:
+                        badge = "OPEN"
+                    elif r.detected_any_status:
+                        badge = "Closed/Dup"
+                    else:
+                        badge = "MISS"
+                    if r.total_sites > 1 and r.detected_open:
+                        badge += f" ({len(r.matched_site_ids_open)}/{r.total_sites})"
+                    cells.append(badge)
+
+                lines.append(
+                    f"| `{t.ablation_tier}` | {t.repetition} | `{t.model}` | "
+                    f"**{ta.recalled_open}/{ta.total}** | {ta.recalled_poc_verified}/{ta.total} | "
+                    f"{t.total_open_findings} | " + " | ".join(cells) + " |"
+                )
+
+        # Section 3: Detailed Matched Findings by Tier
+        lines.extend(["", "## 3. Matched Findings by Baseline Tier (Primary Trials)", ""])
         cve_meta = {c.cve_id: c for c in ground_truth.cves}
         primary_trials = [t for t in report.trials if not t.is_checkpoint]
         if not primary_trials:
             primary_trials = report.trials
 
+        tier_titles = {
+            "A": "Tier A — Published CVEs / GHSAs",
+            "B": "Tier B — Maintainer-Patched Security Bugs",
+            "C": "Tier C — Zeroization, Attestation & Side-Channel Hardening",
+        }
         for t in primary_trials:
             lines.append(f"### `{t.ablation_tier}` (Rep {t.repetition}, `{t.model}`)")
             lines.append("")
-            for r in t.per_cve:
-                meta = cve_meta[r.cve_id]
-                verdict = (
-                    "DETECTED (Open + PoC)"
-                    if r.detected_poc_verified
-                    else (
-                        "DETECTED (Open)"
-                        if r.detected_open
+            for tier_code in ("A", "B", "C"):
+                tier_items = [r for r in t.per_cve if r.tier == tier_code]
+                if not tier_items:
+                    continue
+                tb = t.by_tier[tier_code]
+                lines.append(
+                    f"#### {tier_titles[tier_code]} "
+                    f"(Open: `{tb.recalled_open}/{tb.total}`, Any-Stage: `{tb.recalled_any_status}/{tb.total}`, PoC: `{tb.recalled_poc_verified}/{tb.total}`)"
+                )
+                lines.append("")
+                for r in tier_items:
+                    # For Tier B/C, show all detected items prominently and summarize missed count cleanly
+                    if tier_code != "A" and not r.detected_any_status:
+                        continue
+                    meta = cve_meta[r.cve_id]
+                    verdict = (
+                        "DETECTED (Open + PoC)"
+                        if r.detected_poc_verified
                         else (
-                            "DETECTED BEFORE TRIAGE (Closed/Duplicate)"
-                            if r.detected_any_status
-                            else "MISSED"
+                            "DETECTED (Open)"
+                            if r.detected_open
+                            else (
+                                "DETECTED BEFORE TRIAGE (Closed/Duplicate)"
+                                if r.detected_any_status
+                                else "MISSED"
+                            )
                         )
                     )
-                )
-                lines.append(
-                    f"- **`{r.cve_id}`** (`{r.ghsa_id}`, {r.severity}) — **{verdict}**: {meta.title}"
-                )
-                for m in r.matched_findings:
-                    poc_tag = ", `poc_verified=True`" if m.poc_verified else ""
                     lines.append(
-                        f"  - Matched `[{m.status}{poc_tag}]` `{m.file}` ({m.location}): *{m.title}*"
+                        f"- **`{r.cve_id}`** ({_format_ref_links(meta)}) — **{verdict}**: {meta.title}"
                     )
-                if not r.matched_findings and r.same_file_unmatched:
-                    lines.append(
-                        "  - *Same-file non-matching findings (manual verification check)*:"
-                    )
-                    for u in r.same_file_unmatched[:5]:
-                        lines.append(f"    - `[{u.status}]` `{u.file}` ({u.location}): *{u.title}*")
-            lines.append("")
+                    for m in r.matched_findings:
+                        poc_tag = ", `poc_verified=True`" if m.poc_verified else ""
+                        lines.append(
+                            f"  - Matched `[{m.status}{poc_tag}]` `{m.file}` ({m.location}): *{m.title}*"
+                        )
+                    if tier_code == "A" and not r.matched_findings and r.same_file_unmatched:
+                        lines.append(
+                            "  - *Same-file non-matching findings (manual verification check)*:"
+                        )
+                        for u in r.same_file_unmatched[:5]:
+                            lines.append(
+                                f"    - `[{u.status}]` `{u.file}` ({u.location}): *{u.title}*"
+                            )
+                if tier_code != "A":
+                    missed_ids = [r.cve_id for r in tier_items if not r.detected_any_status]
+                    if missed_ids:
+                        lines.append(
+                            f"- *Undetected {tier_code} items ({len(missed_ids)})*: "
+                            + ", ".join(f"`{mid}`" for mid in missed_ids)
+                        )
+                lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
 
@@ -461,7 +617,7 @@ class CveRecallEvaluator:
             r"\centering",
             r"\small",
             (
-                r"\caption{Historical Known-CVE Recall on \texttt{"
+                r"\caption{Stratified Security Baseline and Known-CVE Recall on \texttt{"
                 + _escape_latex(ground_truth.upstream_repo)
                 + r"} pinned at \texttt{"
                 + _escape_latex(report.pinned_tag)
@@ -472,7 +628,7 @@ class CveRecallEvaluator:
             r"\label{tab:caliptra-v210-cve-recall}",
             r"\begin{tabular}{llcccc}",
             r"\toprule",
-            r"CVE ID & Affected Component & Severity & Discovered & Final Open & PoC Verified \\",
+            r"Baseline Item / Stratum & Component / Scope & Severity & Discovered & Final Open & PoC Verified \\",
             r"\midrule",
         ]
 
@@ -483,8 +639,9 @@ class CveRecallEvaluator:
         }
         n_trials = max(1, len(primary_trials))
 
-        for cve in ground_truth.cves:
-            comp = ", ".join({s.file.split("/")[0] for s in cve.sites})
+        tier_a_cves = [c for c in ground_truth.cves if c.tier == "A"]
+        for cve in tier_a_cves:
+            comp = ", ".join(sorted({s.file.split("/")[0] for s in cve.sites}))
             disc_hits = 0
             open_hits = 0
             poc_hits = 0
@@ -510,6 +667,40 @@ class CveRecallEvaluator:
                 f"{_escape_latex(cve.severity)} & "
                 f"{fmt(disc_hits)} & {fmt(open_hits)} & {fmt(poc_hits)} \\\\"
             )
+
+        # Stratified aggregate summary rows across Tier A, Tier B, Core A+B, Tier C, Total A-C
+        if any(c.tier != "A" for c in ground_truth.cves):
+            lines.append(r"\midrule")
+            strata_rows = (
+                ("A", "Tier A (Published CVEs)", "5 GHSAs"),
+                ("B", "Tier B (Maintainer Security Bugs)", "22 PRs"),
+                ("A+B", r"\textbf{Core Security Bugs (Tier A+B)}", r"\textbf{27 Bugs}"),
+                ("C", "Tier C (Zeroization \\& Hardening)", "9 PRs"),
+                ("A+B+C", r"\textbf{Complete Baseline (Tier A--C)}", r"\textbf{36 Total}"),
+            )
+            t0 = primary_trials[0]
+            disc_t0 = next(
+                (
+                    dt
+                    for dt in report.trials
+                    if dt.repetition == t0.repetition and dt.ablation_tier.endswith("@discovery")
+                ),
+                None,
+            )
+            for skey, slabel, sscope in strata_rows:
+                tb = t0.by_tier[skey]
+                if tb.total == 0:
+                    continue
+                disc_cnt = (
+                    disc_t0.by_tier[skey].recalled_open
+                    if disc_t0 is not None
+                    else tb.recalled_any_status
+                )
+                lines.append(
+                    f"{slabel} & {sscope} & --- & "
+                    f"{disc_cnt}/{tb.total} & {tb.recalled_open}/{tb.total} & "
+                    f"{tb.recalled_poc_verified}/{tb.total} \\\\"
+                )
 
         lines.extend(
             [
