@@ -79,6 +79,7 @@ let dynamicRoutes = {};
 let runsState = [];
 let currentRunVulns = [];
 let currentRouteParams = {};
+const pinnedSourceCache = new Map();
 
 let worker = null;
 let workerReady = false;
@@ -87,7 +88,7 @@ const workerCallbacks = new Map();
 
 function initWasmWorker() {
   try {
-    worker = new Worker('web/wasm-worker.js', { type: 'module' });
+    worker = new Worker(getAssetUrl('web/wasm-worker.js'), { type: 'module' });
 
     worker.onmessage = (e) => {
       const { id, type, result, error } = e.data;
@@ -283,8 +284,29 @@ async function fetchRunsFromGcsBucket() {
     const allKeys = new Set();
     const keys = [];
     let marker = "";
+    let usedManifest = false;
 
-    while (true) {
+    // Fast path for subdirectory deployments (e.g. /eval-viewer/): try static runs_manifest.json first.
+    try {
+      const manifestRes = await fetch(getAssetUrl(`${API_VERSION}/runs_manifest.json`));
+      if (manifestRes.ok) {
+        const manifestObj = await manifestRes.json();
+        if (manifestObj && Array.isArray(manifestObj.keys)) {
+          usedManifest = true;
+          for (const k of manifestObj.keys) {
+            if (typeof k !== "string" || !k) continue;
+            allKeys.add(k);
+            if (k.endsWith("/metadata.json")) {
+              keys.push(k);
+            }
+          }
+        }
+      }
+    } catch (_manifestErr) {
+      // Fall back to root GCS XML listing below.
+    }
+
+    while (!usedManifest) {
       const query = marker
         ? `?prefix=${RUNS_SUBDIR}/&marker=${encodeURIComponent(marker)}`
         : `?prefix=${RUNS_SUBDIR}/`;
@@ -1456,6 +1478,7 @@ async function renderRunView(proj, job, runId, deepLinkFindingIdx, container) {
         </div>
         ${duplicateBannerHtml}
         ${metadataGridHtml}
+        <div id="modal-pinned-source-mount"></div>
 
         <h4 style="margin-bottom: 6px; font-weight: 600;">Description</h4>
         <p style="color: var(--text-secondary); margin-bottom: 16px; line-height: 1.55;">${formatMarkdownText(v.description || 'No description provided.')}</p>
@@ -1472,12 +1495,142 @@ async function renderRunView(proj, job, runId, deepLinkFindingIdx, container) {
         ${findingReasoningHtml}
       `;
 
-      document.getElementById("btn-copy-finding-link").addEventListener("click", () => {
+      const copyBtn = document.getElementById("btn-copy-finding-link");
+      copyBtn.addEventListener("click", () => {
         navigator.clipboard.writeText(window.location.href);
-        const btn = document.getElementById("btn-copy-finding-link");
-        btn.textContent = "Copied!";
-        setTimeout(() => { btn.textContent = "Copy Direct Link"; }, 2000);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => { copyBtn.textContent = "Copy Direct Link"; }, 2000);
       });
+
+      if (typeof v.source_url === "string" && v.source_url.startsWith("https://github.com/") && copyBtn.parentElement) {
+        const ghGroup = document.createElement("div");
+        ghGroup.style.display = "flex";
+        ghGroup.style.gap = "8px";
+        ghGroup.style.alignItems = "center";
+        const ghLink = document.createElement("a");
+        ghLink.setAttribute("href", v.source_url);
+        ghLink.setAttribute("target", "_blank");
+        ghLink.setAttribute("rel", "noopener noreferrer");
+        ghLink.className = "btn btn-secondary";
+        ghLink.style.fontSize = "0.75rem";
+        ghLink.style.textDecoration = "none";
+        ghLink.textContent = "Open Source on GitHub \u2197";
+        copyBtn.parentElement.replaceChild(ghGroup, copyBtn);
+        ghGroup.appendChild(ghLink);
+        ghGroup.appendChild(copyBtn);
+      }
+
+      const sourceMount = document.getElementById("modal-pinned-source-mount");
+      if (
+        sourceMount &&
+        typeof v.source_repo === "string" &&
+        /^[a-z0-9._-]+$/i.test(v.source_repo) &&
+        typeof v.source_rel_file === "string" &&
+        v.source_rel_file &&
+        !v.source_rel_file.includes("..")
+      ) {
+        const cleanRel = v.source_rel_file.replace(/^\/+/, "");
+        const sourceAssetPath = `${API_VERSION}/sources/${v.source_repo}/${cleanRel}`;
+        let activeCtxMode = "25";
+
+        const renderSourceMount = (lines) => {
+          sourceMount.replaceChildren();
+          if (!lines || lines.length === 0) return;
+
+          const sec = document.createElement("div");
+          sec.className = "modal-source-section";
+
+          const bar = document.createElement("div");
+          bar.className = "modal-source-toolbar";
+
+          const titleEl = document.createElement("h4");
+          titleEl.style.margin = "0";
+          titleEl.style.fontWeight = "600";
+          titleEl.textContent = "Pinned Git Source Context";
+
+          const metaSpan = document.createElement("span");
+          metaSpan.className = "modal-source-meta";
+
+          const tabs = document.createElement("div");
+          tabs.className = "modal-source-tabs";
+
+          const scrollBox = document.createElement("div");
+          scrollBox.className = "modal-source-scroll";
+
+          const total = lines.length;
+          const fStart = v.resolved_start_line && v.resolved_start_line >= 1 ? Math.min(total, v.resolved_start_line) : 1;
+          const fEnd = v.resolved_end_line && v.resolved_end_line >= fStart ? Math.min(total, v.resolved_end_line) : Math.min(total, fStart + 15);
+
+          let wStart = 1;
+          let wEnd = total;
+          if (activeCtxMode !== "full") {
+            const rad = activeCtxMode === "80" ? 80 : 25;
+            wStart = Math.max(1, fStart - rad);
+            wEnd = Math.min(total, fEnd + rad);
+          }
+          scrollBox.classList.toggle("full-height", activeCtxMode === "full");
+          metaSpan.textContent = `Showing L${wStart}\u2013L${wEnd} of ${total} \u2022 Highlighted L${fStart}\u2013L${fEnd}`;
+
+          for (const [mKey, mLabel] of [["25", "\u00b125 lines"], ["80", "\u00b180 lines"], ["full", "Full File"]]) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = activeCtxMode === mKey ? "modal-source-tab active" : "modal-source-tab";
+            b.textContent = mLabel;
+            b.addEventListener("click", () => {
+              activeCtxMode = mKey;
+              renderSourceMount(lines);
+            });
+            tabs.appendChild(b);
+          }
+
+          let firstHit = null;
+          const frag = document.createDocumentFragment();
+          for (let ln = wStart; ln <= wEnd; ln += 1) {
+            const row = document.createElement("div");
+            const hit = ln >= fStart && ln <= fEnd;
+            row.className = hit ? "modal-src-line highlighted" : "modal-src-line";
+            const lnSpan = document.createElement("span");
+            lnSpan.className = "modal-src-ln";
+            lnSpan.textContent = String(ln);
+            const codeSpan = document.createElement("span");
+            codeSpan.className = "modal-src-code";
+            codeSpan.textContent = lines[ln - 1] || " ";
+            row.appendChild(lnSpan);
+            row.appendChild(codeSpan);
+            frag.appendChild(row);
+            if (hit && !firstHit) firstHit = row;
+          }
+          scrollBox.appendChild(frag);
+
+          bar.appendChild(titleEl);
+          bar.appendChild(metaSpan);
+          bar.appendChild(tabs);
+          sec.appendChild(bar);
+          sec.appendChild(scrollBox);
+          sourceMount.appendChild(sec);
+
+          window.requestAnimationFrame(() => {
+            if (firstHit) {
+              scrollBox.scrollTop = Math.max(0, firstHit.offsetTop - 80);
+            }
+          });
+        };
+
+        if (pinnedSourceCache.has(sourceAssetPath)) {
+          renderSourceMount(pinnedSourceCache.get(sourceAssetPath));
+        } else {
+          fetch(getAssetUrl(sourceAssetPath))
+            .then((r) => (r.ok ? r.text() : null))
+            .then((txt) => {
+              if (typeof txt === "string") {
+                const splitLines = txt.split(/\r?\n/);
+                pinnedSourceCache.set(sourceAssetPath, splitLines);
+                renderSourceMount(splitLines);
+              }
+            })
+            .catch(() => {});
+        }
+      }
 
       document.getElementById("vulnerability-modal").classList.remove("hidden");
     };

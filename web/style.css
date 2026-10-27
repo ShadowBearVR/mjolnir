@@ -824,4 +824,93 @@ tr:last-child td {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* Modal Pinned Git Source Viewer */
+.modal-source-section {
+  margin-bottom: 18px;
+}
+
+.modal-source-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.modal-source-meta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.modal-source-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.modal-source-tab {
+  padding: 3px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.modal-source-tab.active {
+  border-color: #38bdf8;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+}
+
+.modal-source-scroll {
+  max-height: 360px;
+  overflow: auto;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-main, #0f172a);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.48;
+}
+
+.modal-source-scroll.full-height {
+  max-height: 520px;
+}
+
+.modal-src-line {
+  display: flex;
+  min-width: max-content;
+  padding-right: 12px;
+  border-left: 3px solid transparent;
+}
+
+.modal-src-line.highlighted {
+  background: rgba(245, 158, 11, 0.14);
+  border-left-color: #f59e0b;
+}
+
+.modal-src-ln {
+  flex: 0 0 52px;
+  padding: 0 10px 0 6px;
+  text-align: right;
+  color: var(--text-muted);
+  user-select: none;
+  border-right: 1px solid var(--border);
+  margin-right: 12px;
+}
+
+.modal-src-line.highlighted .modal-src-ln {
+  color: #fbbf24;
+  font-weight: 700;
+}
+
+.modal-src-code {
+  white-space: pre;
+  color: var(--text-primary);
+}
+
 

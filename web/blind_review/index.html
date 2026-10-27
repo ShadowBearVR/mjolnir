@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<!-- Licensed under the Apache-2.0 license -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta name="description" content="Provenance-stripped single-page blind expert review application for Mjolnir security evaluation findings.">
+  <title>Mjolnir Blind Expert Review</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23111827'/%3E%3Ctext x='50' y='69' text-anchor='middle' font-family='monospace' font-weight='700' font-size='58' fill='%2327bcac'%3EM%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar" id="app-topbar">
+    <div class="topbar-brand">
+      <h1 class="topbar-title" id="deck-title">Mjolnir Blind Vulnerability Review</h1>
+      <span class="pill pill-mono" id="target-commit-pill">Loading deck...</span>
+      <a class="pill hidden" id="repo-tree-link" href="https://github.com/" target="_blank" rel="noopener noreferrer">Repo Tree &#8599;</a>
+    </div>
+
+    <div class="topbar-progress" aria-label="Review completion progress">
+      <div class="progress-track">
+        <svg class="progress-svg" viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label="Completion bar">
+          <rect id="progress-rect" x="0" y="0" width="0" height="8" rx="4"></rect>
+        </svg>
+      </div>
+      <span class="progress-label" id="progress-count-label">0 / 0</span>
+      <span class="save-status" id="autosave-status-label">Not signed in</span>
+    </div>
+
+    <div class="topbar-actions">
+      <span class="pill pill-mono" id="active-ldap-pill">LDAP: --</span>
+      <button type="button" class="btn btn-ghost" id="btn-switch-ldap">Switch LDAP</button>
+      <button type="button" class="btn" id="btn-toggle-tm" aria-expanded="false" aria-controls="threat-model-drawer">Threat Model</button>
+      <input type="file" class="hidden" id="input-load-json" accept=".json,application/json">
+      <button type="button" class="btn" id="btn-load-json">Load Saved JSON</button>
+      <button type="button" class="btn btn-primary" id="btn-download-json">Download Review JSON</button>
+    </div>
+  </header>
+
+  <div class="notice-banner hidden" id="notice-banner" role="status" aria-live="polite">
+    <span id="notice-banner-text"></span>
+    <button type="button" class="btn btn-ghost" id="btn-dismiss-notice">Dismiss</button>
+  </div>
+
+  <section class="tm-drawer hidden" id="threat-model-drawer" aria-label="Repository Threat Model">
+    <div class="tm-drawer-header">
+      <strong>Target Repository Threat Model (Verbatim Reference)</strong>
+      <button type="button" class="btn btn-ghost" id="btn-close-tm">Close</button>
+    </div>
+    <pre class="tm-pre" id="threat-model-content">No threat model attached to this deck.</pre>
+  </section>
+
+  <div class="workspace">
+    <aside class="file-rail" aria-label="Files and Filters">
+      <div class="rail-controls">
+        <nav class="filter-tabs" aria-label="Card status filter">
+          <button type="button" class="filter-tab active" id="filter-tab-all" data-filter="all">All</button>
+          <button type="button" class="filter-tab" id="filter-tab-unlabeled" data-filter="unlabeled">Unlabeled</button>
+          <button type="button" class="filter-tab" id="filter-tab-tp" data-filter="tp">TP</button>
+          <button type="button" class="filter-tab" id="filter-tab-fp" data-filter="fp">FP</button>
+          <button type="button" class="filter-tab" id="filter-tab-flagged" data-filter="flagged">Bookmarked</button>
+        </nav>
+        <input
+          type="search"
+          class="search-box"
+          id="input-search-cards"
+          placeholder="Search file, ID, CWE, or title (/)"
+          aria-label="Search review cards"
+        >
+      </div>
+      <div class="file-list" id="file-group-list" role="list"></div>
+    </aside>
+
+    <main class="card-stage" id="card-stage">
+      <article class="card-shell" id="active-card-shell">
+        <div class="card-header">
+          <div class="card-meta-row">
+            <div class="card-badges" id="card-badges">
+              <span class="badge-id" id="card-id-badge">BF-0000</span>
+              <span class="badge-sev badge-sev-Medium" id="card-sev-badge">MEDIUM</span>
+              <span class="pill pill-mono" id="card-cwe-pill">CWE</span>
+              <span class="pill" id="card-position-pill">Card 0 of 0</span>
+            </div>
+            <div class="card-badges">
+              <span class="pill" id="card-current-verdict-pill">Unlabeled</span>
+            </div>
+          </div>
+
+          <h2 class="card-title" id="card-title-heading">Loading review deck...</h2>
+
+          <div class="card-loc-bar">
+            <code class="loc-code" id="card-location-code">--</code>
+            <a
+              class="btn hidden"
+              id="card-github-link"
+              href="https://github.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+            >Open Source on GitHub &#8599;</a>
+          </div>
+        </div>
+
+        <div class="card-body" id="card-body-sections">
+          <section class="section-block hidden" id="section-source-snippet">
+            <div class="source-toolbar">
+              <h3>Pinned Git Source Context</h3>
+              <span class="source-range-meta" id="source-range-label"></span>
+              <div class="source-ctx-tabs" role="group" aria-label="Source context window">
+                <button type="button" class="filter-tab active" id="btn-src-ctx-25" data-ctx="25">&#177;25 lines</button>
+                <button type="button" class="filter-tab" id="btn-src-ctx-80" data-ctx="80">&#177;80 lines</button>
+                <button type="button" class="filter-tab" id="btn-src-ctx-full" data-ctx="full">Full File</button>
+              </div>
+            </div>
+            <div class="source-viewer-scroll" id="card-source-scroll"></div>
+          </section>
+
+          <section class="section-block" id="section-description">
+            <h3>Vulnerability Claim Description</h3>
+            <div class="rich-text" id="card-description-content"></div>
+          </section>
+
+          <section class="section-block hidden" id="section-attack-vector">
+            <h3>Attack Vector</h3>
+            <div class="rich-text" id="card-attack-vector-content"></div>
+          </section>
+
+          <section class="section-block hidden" id="section-recommendation">
+            <h3>Suggested Remediation</h3>
+            <div class="rich-text" id="card-recommendation-content"></div>
+          </section>
+
+          <section class="section-block hidden" id="section-pass2-poc">
+            <h3>Pass-2 Proof-of-Concept Artifacts</h3>
+            <div class="poc-tabs" id="poc-tab-bar">
+              <button type="button" class="filter-tab active" id="btn-poc-tab-diff" data-poc-tab="diff">poc_patch.diff</button>
+              <button type="button" class="filter-tab" id="btn-poc-tab-repro" data-poc-tab="repro">reproduce.sh</button>
+              <button type="button" class="filter-tab" id="btn-poc-tab-log" data-poc-tab="log">harness_commands.log (tail)</button>
+              <button type="button" class="filter-tab" id="btn-poc-tab-summary" data-poc-tab="summary">PoC Summary</button>
+            </div>
+            <pre class="code-block" id="card-poc-artifact-pre"></pre>
+          </section>
+        </div>
+
+        <footer class="grade-dock" id="card-grade-dock">
+          <div class="grade-helper" id="grade-helper-text">
+            TP = Genuine security vulnerability under the repository threat model. FP = Not exploitable, prevented by existing checks/hardware invariants, or out of threat model scope.
+          </div>
+
+          <div class="verdict-row">
+            <div class="verdict-buttons" id="pass1-verdict-group">
+              <button type="button" class="btn btn-verdict" id="btn-verdict-tp">
+                True Positive (TP) <span class="kbd-hint">T</span>
+              </button>
+              <button type="button" class="btn btn-verdict" id="btn-verdict-fp">
+                False Positive (FP) <span class="kbd-hint">F</span>
+              </button>
+            </div>
+
+            <div class="verdict-buttons hidden" id="pass2-verdict-group">
+              <button type="button" class="btn btn-verdict" id="btn-verdict-yes">
+                PoC Demonstrates Bug (Yes) <span class="kbd-hint">Y</span>
+              </button>
+              <button type="button" class="btn btn-verdict" id="btn-verdict-no">
+                Does Not Demonstrate (No) <span class="kbd-hint">N</span>
+              </button>
+            </div>
+
+            <div class="verdict-buttons">
+              <button type="button" class="btn btn-verdict" id="btn-toggle-flag">
+                Bookmark for Revisit <span class="kbd-hint">B</span>
+              </button>
+              <button type="button" class="btn btn-ghost" id="btn-clear-verdict">Clear Verdict</button>
+            </div>
+          </div>
+
+          <div class="severity-row" id="pass1-severity-row">
+            <span class="severity-label">Expert Severity (optional, defaults to reported on TP):</span>
+            <button type="button" class="btn btn-sev" id="btn-sev-critical" data-sev="Critical">Critical <span class="kbd-hint">1</span></button>
+            <button type="button" class="btn btn-sev" id="btn-sev-high" data-sev="High">High <span class="kbd-hint">2</span></button>
+            <button type="button" class="btn btn-sev" id="btn-sev-medium" data-sev="Medium">Medium <span class="kbd-hint">3</span></button>
+            <button type="button" class="btn btn-sev" id="btn-sev-low" data-sev="Low">Low <span class="kbd-hint">4</span></button>
+            <button type="button" class="btn btn-sev" id="btn-sev-info" data-sev="Informational">Info <span class="kbd-hint">5</span></button>
+          </div>
+
+          <div class="notes-row">
+            <textarea
+              class="notes-input"
+              id="textarea-card-notes"
+              maxlength="1000"
+              placeholder="Optional technical note (e.g., why blocked by hardware state machine, duplicate of another card in this file, or severity rationale)..."
+              aria-label="Reviewer notes for current card"
+            ></textarea>
+          </div>
+
+          <div class="nav-row">
+            <button type="button" class="btn" id="btn-prev-card">
+              &#8592; Previous <span class="kbd-hint">K</span>
+            </button>
+            <button type="button" class="btn" id="btn-next-unlabeled">
+              Next Unlabeled &#8618;
+            </button>
+            <button type="button" class="btn btn-primary" id="btn-next-card">
+              Next &#8594; <span class="kbd-hint">J</span>
+            </button>
+          </div>
+        </footer>
+      </article>
+    </main>
+  </div>
+
+  <div class="modal-overlay hidden" id="ldap-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="ldap-modal-heading">
+    <div class="modal-box">
+      <h2 id="ldap-modal-heading">Blind Expert Review Sign-In</h2>
+      <p>
+        Enter your LDAP username to autosave your progress in this browser's local storage.
+        All cards are grouped by file so you only inspect each source file once. When finished, click
+        <strong>Download Review JSON</strong> and send the exported file to the study coordinator.
+      </p>
+      <form id="form-ldap-entry" novalidate>
+        <div class="form-field">
+          <label for="input-reviewer-ldap">Reviewer LDAP (e.g., <code>alice</code>)</label>
+          <input
+            type="text"
+            class="form-input"
+            id="input-reviewer-ldap"
+            autocomplete="username"
+            spellcheck="false"
+            maxlength="64"
+            placeholder="ldap"
+            required
+          >
+          <div class="form-error" id="ldap-form-error"></div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="btn-confirm-ldap">Start / Resume Review</button>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
