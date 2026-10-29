@@ -8,8 +8,14 @@ from constants import DEFAULT_TOOL_OUTPUT_MAX_CHARS
 
 def _truncate(result: object, max_chars: int) -> object:
     if isinstance(result, str) and len(result) > max_chars:
-        truncated_info = f"\n\n... [Observation truncated at {max_chars} characters (~{max_chars // 4} tokens). To inspect remaining contents, specify narrower query terms or line ranges (start_line/end_line).]"
-        return result[:max_chars] + truncated_info
+        half = max_chars // 2
+        omitted = len(result) - max_chars
+        truncated_info = (
+            f"\n\n... [Observation truncated: omitted {omitted} middle characters "
+            f"(limit {max_chars} chars, ~{max_chars // 4} tokens). "
+            f"Showing first {half} and last {max_chars - half} characters.] ...\n\n"
+        )
+        return result[:half] + truncated_info + result[-(max_chars - half) :]
     return result
 
 

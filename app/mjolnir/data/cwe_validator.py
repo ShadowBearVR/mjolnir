@@ -46,22 +46,24 @@ def normalize_and_validate_cwe(val: Optional[str]) -> str:
         # Fallback if catalog not loaded
         return raw
 
-    # Match ID pattern: CWE-123
-    match = re.match(r"^(CWE-\d+)", raw, re.IGNORECASE)
-    if not match:
-        raise ValueError(
-            f"Invalid CWE format: '{raw}'. Expected 'CWE-<NUMBER>' (e.g., 'CWE-20', 'CWE-1256')."
-        )
+    # Match ID pattern: CWE-123 (either at start or anywhere in string)
+    match = re.search(r"(CWE-\d+)", raw, re.IGNORECASE)
+    if match:
+        cwe_id = match.group(1).upper()
+        if cwe_id in catalog:
+            canonical_name = catalog[cwe_id].get("name", "Unknown Weakness")
+            return f"{cwe_id}: {canonical_name}"
+        # Fallback for MITRE CWE Category/Pillar IDs (e.g. CWE-320: Key Management Errors)
+        # that are not in the CWE-1000 weakness subset: search by title or preserve as-is
+        matches = search_cwe_catalog(raw, limit=1)
+        if matches:
+            return f"{matches[0]['id']}: {matches[0]['name']}"
+        return raw
 
-    cwe_id = match.group(1).upper()
-    if cwe_id not in catalog:
-        raise ValueError(
-            f"Unrecognized or hallucinated CWE identifier: '{cwe_id}'. "
-            "Must be an official MITRE CWE ID from the CWE-1000 catalog."
-        )
-
-    canonical_name = catalog[cwe_id].get("name", "Unknown Weakness")
-    return f"{cwe_id}: {canonical_name}"
+    matches = search_cwe_catalog(raw, limit=1)
+    if matches:
+        return f"{matches[0]['id']}: {matches[0]['name']}"
+    return ""
 
 
 def search_cwe_catalog(query: str, limit: int = 5) -> list[dict]:

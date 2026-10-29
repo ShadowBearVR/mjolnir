@@ -33,8 +33,20 @@ class UsageTracker:
     def __init__(self, run_dir: str = None):
         self.run_dir = run_dir
         self.usage_by_agent = {}
+        self.usage_by_phase = {}
+        self._current_phase = "project_exploration"
         self.error_counts = {}
+        self.refusal_counts = {
+            "total_safety_refusals": 0,
+            "hard_safety_refusals": 0,
+            "soft_refusals": 0,
+            "api_safety_blocks": 0,
+            "schema_validation_drops": 0,
+            "by_agent": {},
+            "by_phase": {},
+        }
         self.total_usage = {
+            "llm_calls": 0,
             "prompt_tokens": 0,
             "uncached_tokens": 0,
             "cache_tokens": 0,
@@ -46,6 +58,7 @@ class UsageTracker:
             "total_errors": 0,
         }
         self.tool_usage_by_agent = {}
+        self.tool_usage_by_phase = {}
         self.tool_usage_by_tool = {}
         self.tool_calls_per_item = {}
         self.total_tool_usage = {
@@ -61,8 +74,9 @@ class UsageTracker:
         success: bool,
         agent_name: str = "UnknownAgent",
         item_key: str | None = None,
+        phase_id: str | None = None,
     ):
-        """Records a tool invocation, success, failure, and per-item stat."""
+        """Records a tool invocation, success, failure, and per-item/per-phase stat."""
 
         self.total_tool_usage["total_calls"] += 1
         if success:
@@ -94,6 +108,22 @@ class UsageTracker:
         else:
             self.tool_usage_by_agent[agent_name][tool_name]["failures"] += 1
 
+        # Per-phase breakdown
+        eff_phase = phase_id or self._current_phase or "discovery"
+        if eff_phase not in self.tool_usage_by_phase:
+            self.tool_usage_by_phase[eff_phase] = {}
+        if tool_name not in self.tool_usage_by_phase[eff_phase]:
+            self.tool_usage_by_phase[eff_phase][tool_name] = {
+                "calls": 0,
+                "successes": 0,
+                "failures": 0,
+            }
+        self.tool_usage_by_phase[eff_phase][tool_name]["calls"] += 1
+        if success:
+            self.tool_usage_by_phase[eff_phase][tool_name]["successes"] += 1
+        else:
+            self.tool_usage_by_phase[eff_phase][tool_name]["failures"] += 1
+
         # Per-item breakdown
         if item_key:
             if agent_name not in self.tool_calls_per_item:
@@ -101,6 +131,40 @@ class UsageTracker:
             self.tool_calls_per_item[agent_name][item_key] = (
                 self.tool_calls_per_item[agent_name].get(item_key, 0) + 1
             )
+
+    def track_refusal(
+        self,
+        kind: str,
+        agent_name: str = "UnknownAgent",
+        phase_id: str | None = None,
+    ):
+        """Records a safety refusal or non-refusal schema validation drop."""
+        if kind not in (
+            "hard_safety_refusals",
+            "soft_refusals",
+            "api_safety_blocks",
+            "schema_validation_drops",
+        ):
+            return
+        self.refusal_counts[kind] += 1
+        is_safety = kind != "schema_validation_drops"
+        if is_safety:
+            self.refusal_counts["total_safety_refusals"] += 1
+        eff_phase = phase_id or self._current_phase or "discovery"
+        for map_key, bucket_id in (("by_agent", agent_name), ("by_phase", eff_phase)):
+            b = self.refusal_counts[map_key].setdefault(
+                bucket_id,
+                {
+                    "total_safety_refusals": 0,
+                    "hard_safety_refusals": 0,
+                    "soft_refusals": 0,
+                    "api_safety_blocks": 0,
+                    "schema_validation_drops": 0,
+                },
+            )
+            b[kind] += 1
+            if is_safety:
+                b["total_safety_refusals"] += 1
 
     def track_error(self, e: Exception, agent_name: str = "system"):
         """Records an encountered error to surface in the final summary."""
@@ -118,6 +182,14 @@ class UsageTracker:
         self.total_usage["total_errors"] += 1
         self.error_counts[err_key] = self.error_counts.get(err_key, 0) + 1
 
+        upper_err = err_key.upper()
+        if (
+            any(w in upper_err for w in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"))
+            and "HARDSAFETYREFUSAL" not in upper_err
+            and "SOFTREFUSAL" not in upper_err
+        ):
+            self.track_refusal("api_safety_blocks", agent_name=agent_name)
+
         if agent_name not in self.usage_by_agent:
             self.usage_by_agent[agent_name] = self._get_empty_agent_stats()
 
@@ -126,6 +198,7 @@ class UsageTracker:
     def _get_empty_agent_stats(self):
         return {
             "model": "unknown",
+            "llm_calls": 0,
             "prompt_tokens": 0,
             "uncached_tokens": 0,
             "cache_tokens": 0,
@@ -245,6 +318,7 @@ class UsageTracker:
                     success=not is_error,
                     agent_name=agent_name,
                     item_key=item_key,
+                    phase_id=self._resolve_phase_id(ev, agent_name, item_key),
                 )
                 log_entries.append(
                     {
@@ -255,7 +329,69 @@ class UsageTracker:
                     }
                 )
 
-    def _track_token_metadata(self, ev: Any, agent_name: str):
+    def set_phase(self, phase_id: str) -> None:
+        """Explicitly updates the active pipeline phase at the start of an ADK workflow node."""
+        if phase_id:
+            self._current_phase = phase_id
+
+    def _resolve_phase_id(self, ev: Any, agent_name: str, item_key: str | None) -> str:
+        """Resolves the pipeline phase ID associated with an ADK event."""
+        node_name = str(getattr(ev, "node_name", "") or "").strip()
+        node_map = {
+            "project_exploration_phase": "project_exploration",
+            "discovery_phase": "discovery",
+            "ingest_report_phase": "discovery",
+            "deduplication_phase": "deduplication",
+            "initial_review_phase": "initial_review",
+            "poc_creation_phase": "poc_creation",
+            "final_review_phase": "final_review",
+        }
+        if node_name in node_map:
+            self._current_phase = node_map[node_name]
+
+        key_str = str(item_key or "")
+        if key_str == "project_exploration":
+            return "project_exploration"
+        if ".ProjectExpertAgent@" in key_str:
+            caller = key_str.split(".ProjectExpertAgent@", 1)[0]
+            if caller.startswith("final_review"):
+                return "final_review"
+            if caller.startswith("initial_review"):
+                return "initial_review"
+            if caller.startswith("poc_creation") or caller.startswith("poc_"):
+                return "poc_creation"
+            if caller == "deduplication":
+                return "deduplication"
+            return "discovery"
+        if key_str.startswith("expert_query_"):
+            return (
+                self._current_phase
+                if self._current_phase and self._current_phase != "project_exploration"
+                else "discovery"
+            )
+        if key_str.startswith("final_review"):
+            return "final_review"
+        if key_str.startswith("initial_review"):
+            return "initial_review"
+        if key_str == "deduplication":
+            return "deduplication"
+        if agent_name == "ExploitCreationAgent" or key_str.startswith("poc_"):
+            return "poc_creation"
+        if agent_name == "DeduplicationAgent":
+            return "deduplication"
+        if agent_name == "AuditorAgent":
+            return "discovery"
+        if agent_name == "AdversarialReviewerAgent":
+            return (
+                self._current_phase
+                if self._current_phase in ("initial_review", "final_review")
+                else "initial_review"
+            )
+        if agent_name == "ProjectExpertAgent":
+            return self._current_phase or "project_exploration"
+        return self._current_phase or "discovery"
+
+    def _track_token_metadata(self, ev: Any, agent_name: str, item_key: str | None = None):
         """Extracts and accumulates token usage counters from event usage_metadata."""
         if not hasattr(ev, "usage_metadata") or not ev.usage_metadata:
             return
@@ -264,25 +400,45 @@ class UsageTracker:
         o_tokens = getattr(ev.usage_metadata, "candidates_token_count", 0) or 0
         c_tokens = getattr(ev.usage_metadata, "cached_content_token_count", 0) or 0
         t_tokens = getattr(ev.usage_metadata, "thoughts_token_count", 0) or 0
+        tot_api = getattr(ev.usage_metadata, "total_token_count", 0) or 0
         u_tokens = max(0, p_tokens - c_tokens)
 
+        phase_id = self._resolve_phase_id(ev, agent_name, item_key)
         if agent_name not in self.usage_by_agent:
             self.usage_by_agent[agent_name] = self._get_empty_agent_stats()
+        if phase_id not in self.usage_by_phase:
+            self.usage_by_phase[phase_id] = self._get_empty_agent_stats()
 
-        if self.usage_by_agent[agent_name]["model"] == "unknown" and getattr(
-            ev, "model_version", None
-        ):
-            self.usage_by_agent[agent_name]["model"] = ev.model_version
+        model_ver = getattr(ev, "model_version", None)
+        if model_ver:
+            if self.usage_by_agent[agent_name].get("model", "unknown") == "unknown":
+                self.usage_by_agent[agent_name]["model"] = model_ver
+            if self.usage_by_phase[phase_id].get("model", "unknown") == "unknown":
+                self.usage_by_phase[phase_id]["model"] = model_ver
 
         input_tokens = p_tokens
-        output_tokens = o_tokens + t_tokens
+        # Note: LiteLLM/Anthropic/OpenAI completion_tokens (candidates_token_count) already includes
+        # reasoning_tokens (thoughts_token_count), whereas Gemini reports them separately but sets
+        # total_token_count = prompt + candidates + thoughts. Using (tot_api - p_tokens) when
+        # tot_api >= (p_tokens + o_tokens) handles both Gemini and LiteLLM without double-counting.
+        if tot_api >= (p_tokens + o_tokens) and tot_api > 0:
+            output_tokens = max(o_tokens, tot_api - p_tokens)
+            pure_out_tokens = max(0, output_tokens - t_tokens)
+        else:
+            pure_out_tokens = o_tokens
+            output_tokens = o_tokens + t_tokens
         all_tokens = input_tokens + output_tokens
 
-        for bucket in (self.usage_by_agent[agent_name], self.total_usage):
+        for bucket in (
+            self.usage_by_agent[agent_name],
+            self.usage_by_phase[phase_id],
+            self.total_usage,
+        ):
+            bucket["llm_calls"] += 1
             bucket["prompt_tokens"] += p_tokens
             bucket["uncached_tokens"] += u_tokens
             bucket["cache_tokens"] += c_tokens
-            bucket["output_tokens"] += o_tokens
+            bucket["output_tokens"] += pure_out_tokens
             bucket["thoughts_tokens"] += t_tokens
             bucket["total_input_tokens"] += input_tokens
             bucket["total_output_tokens"] += output_tokens
@@ -291,10 +447,11 @@ class UsageTracker:
     def track_event(self, ev: Any, agent_name: str = "UnknownAgent"):
         """Extracts token usage metadata and function calls/responses from an ADK event."""
         agent_name, item_key, target_key = self._resolve_event_keys(ev, agent_name)
+        self._resolve_phase_id(ev, agent_name, item_key)
         self._track_finish_reason(ev, agent_name, target_key)
         self._track_event_error(ev, agent_name, target_key)
         self._track_content_parts(ev, agent_name, item_key, target_key)
-        self._track_token_metadata(ev, agent_name)
+        self._track_token_metadata(ev, agent_name, item_key)
 
     @staticmethod
     def _calc_stats(counts: list[int]) -> dict[str, Any]:
@@ -335,7 +492,9 @@ class UsageTracker:
         token_data = {
             "total": self.total_usage,
             "errors_grouped": self.error_counts,
+            "refusals": self.refusal_counts,
             "by_agent": self.usage_by_agent,
+            "by_phase": self.usage_by_phase,
         }
         token_path = Path(run_dir) / "token_usage.json"
         with open(token_path, "w") as f:
@@ -370,6 +529,15 @@ class UsageTracker:
                 rate = f"{(f_count / c * 100):.2f}%" if c > 0 else "0.00%"
                 by_agent_formatted[a_name]["tools"][t_name] = {**stats, "failure_rate": rate}
 
+        by_phase_formatted = {}
+        for p_id, tools in self.tool_usage_by_phase.items():
+            by_phase_formatted[p_id] = {}
+            for t_name, stats in tools.items():
+                c = stats["calls"]
+                f_count = stats["failures"]
+                rate = f"{(f_count / c * 100):.2f}%" if c > 0 else "0.00%"
+                by_phase_formatted[p_id][t_name] = {**stats, "failure_rate": rate}
+
         overall_stats = self._calc_stats(all_item_counts)
 
         tool_data = {
@@ -380,6 +548,7 @@ class UsageTracker:
             },
             "by_tool": by_tool_formatted,
             "by_agent": by_agent_formatted,
+            "by_phase": by_phase_formatted,
             "per_item": self.tool_calls_per_item,
         }
         tool_path = Path(run_dir) / "tool_usage.json"

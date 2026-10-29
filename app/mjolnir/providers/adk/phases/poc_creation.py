@@ -55,15 +55,36 @@ def _assemble_ground_truth_poc_bundle(
     # A PoC is verified ONLY IF:
     # 1. Non-empty diff exists.
     # 2. At least one harness command was executed.
-    # 3. No baseline lines were deleted or modified.
-    # 4. No production code files were altered (only test/harness code).
+    # 3. The final harness command exited cleanly with returncode == 0.
+    # 4. The final harness output is not a vacuous 0-test filter run.
+    # 5. No baseline lines were deleted or modified in production/build files.
+    # 6. No production code or non-test build targets were altered.
     has_test_execution = bool(sandbox.command_history)
+    last_returncode = sandbox.command_history[-1].returncode if has_test_execution else None
+    vacuous_test_run = (
+        WorktreeSandbox.is_vacuous_test_output(sandbox.command_history[-1].output)
+        if has_test_execution
+        else False
+    )
+    agent_claimed_verified = bool(finding.poc_verified)
+    gate_rejected = False
 
     if finding.poc_verified:
-        if not actual_diff or not has_test_execution or removed_baseline_lines > 0 or prod_modified:
+        if (
+            not actual_diff
+            or not has_test_execution
+            or last_returncode != 0
+            or vacuous_test_run
+            or removed_baseline_lines > 0
+            or prod_modified
+        ):
             finding.poc_verified = False
+            gate_rejected = True
 
-    status_lines = []
+    status_lines = [
+        f"- **Pre-Gate Agent Claimed `poc_verified`**: `{agent_claimed_verified}`",
+        f"- **Mechanical Gate Rejected**: `{gate_rejected}`",
+    ]
     if getattr(finding, "cwe", None):
         status_lines.append(f"- **MITRE CWE**: `{finding.cwe}`")
     if getattr(finding, "attack_boundary", None):
@@ -77,9 +98,8 @@ def _assemble_ground_truth_poc_bundle(
         ]
     )
     if has_test_execution:
-        status_lines.append(
-            f"- **Final Command Exit Code**: `{sandbox.command_history[-1].returncode}`"
-        )
+        status_lines.append(f"- **Final Command Exit Code**: `{last_returncode}`")
+        status_lines.append(f"- **Vacuous Test Filter (`0` Tests Executed)**: `{vacuous_test_run}`")
 
     sections: list[str] = [
         POC_VERIFICATION_STATUS_SECTION_TEMPLATE.format(
@@ -131,6 +151,8 @@ async def poc_creation_phase(
     phase_id = PHASE_POC_CREATION_ID
     phase_name = PHASE_POC_CREATION_NAME
     logger.info(f"Starting {phase_name} ({phase_id})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(phase_id)
 
     vulnerabilities = (
         node_input if isinstance(node_input, list) else list(ctx.state.get("vulnerabilities", []))
@@ -169,7 +191,9 @@ async def poc_creation_phase(
                     f"Skipped: Severity ({v.severity.value}) is below minimum PoC threshold ({min_poc_severity}).",
                 )
         ctx.state["vulnerabilities"] = vulnerabilities
-        checkpoint_audit_findings(ctx, vulnerabilities, phase_id)
+        await checkpoint_audit_findings(
+            vulnerabilities, run_dir, phase_id=phase_id, state=ctx.state
+        )
         return vulnerabilities
 
     exploiter_tools = get_exploiter_tools(enable_project_expert=enable_project_expert)
@@ -197,6 +221,9 @@ async def poc_creation_phase(
         async def create_poc_for_vuln(vuln: Union[Vulnerability, dict]) -> Vulnerability:
             if isinstance(vuln, dict):
                 vuln = Vulnerability.model_validate(vuln)
+
+            if any(getattr(h, "phase_id", None) == phase_id for h in getattr(vuln, "history", [])):
+                return vuln
 
             if getattr(vuln, "status", Status.OPEN) != Status.OPEN:
                 vuln.add_skipped(phase_id, phase_name, f"Skipped: Status is {vuln.status}")

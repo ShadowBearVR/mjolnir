@@ -66,6 +66,7 @@ async def patch_worktree_file(
 
     new_text = current_text.replace(target_content, replacement_content, 1)
     sandbox.write_file(rel_path, new_text)
+    sandbox._last_edit_seq = getattr(sandbox, "_last_edit_seq", 0) + 1
     logger.debug(f"[Tool Execution] patch_worktree_file: updated {rel_path}")
     return f"Successfully patched '{rel_path}' in sandbox ({len(new_text.splitlines())} lines)."
 
@@ -96,6 +97,7 @@ async def write_worktree_file(
 
     rel_path = str(safe_path.relative_to(sandbox.worktree_dir))
     sandbox.write_file(rel_path, content)
+    sandbox._last_edit_seq = getattr(sandbox, "_last_edit_seq", 0) + 1
     logger.debug(f"[Tool Execution] write_worktree_file: wrote {rel_path}")
     return f"Successfully wrote '{rel_path}' in sandbox ({len(content.splitlines())} lines)."
 
@@ -124,9 +126,23 @@ async def run_harness_command(
         return f"Error: {err}"
 
     logger.info(f"      [PoC Sandbox] Executing: {command}")
+    if (
+        len(sandbox.command_history) >= 2
+        and all(r.command.strip() == command.strip() for r in sandbox.command_history[-2:])
+        and getattr(sandbox, "_last_edit_seq", 0) == getattr(sandbox, "_last_cmd_edit_seq", 0)
+    ):
+        last_rec = sandbox.command_history[-1]
+        return (
+            f"Command: {last_rec.command}\nExit Code: {last_rec.returncode}\n"
+            f"[Cached result: identical command already executed with no intervening file edits. "
+            f"Do NOT re-run the same command again. If the test succeeded, call `get_worktree_diff` "
+            f"and then submit your final response via `set_model_response`.]\n"
+            f"Output:\n{last_rec.output}"
+        )
     record = await sandbox.run_harness_command_async(
         command=command, timeout_seconds=timeout_seconds
     )
+    sandbox._last_cmd_edit_seq = getattr(sandbox, "_last_edit_seq", 0)
     return f"Command: {record.command}\nExit Code: {record.returncode}\nOutput:\n{record.output}"
 
 

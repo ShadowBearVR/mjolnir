@@ -67,6 +67,8 @@ async def checkpoint_audit_findings(
 async def discovery_phase(ctx: Context, node_input: list[str] | None = None) -> list[Vulnerability]:
     """Dynamic File Auditing (Discovery) Phase."""
     logger.info(f"Starting {PHASE_DISCOVERY_NAME} ({PHASE_DISCOVERY_ID})...")
+    if (tracker := ctx.state.get("usage_tracker")) and hasattr(tracker, "set_phase"):
+        tracker.set_phase(PHASE_DISCOVERY_ID)
 
     target_files = node_input if isinstance(node_input, list) else list(ctx.state.get("files", []))
     model = ctx.state["model"]
@@ -77,9 +79,16 @@ async def discovery_phase(ctx: Context, node_input: list[str] | None = None) -> 
     batch_size = ctx.state["batch_size"]
     run_dir = ctx.state.get("run_dir")
 
+    active_extensions = {
+        Path(f).suffix.lstrip(".").lower() for f in target_files if Path(f).suffix
+    } or set(ctx.state.get("extensions") or [])
+
     auditor_tools = get_auditor_tools(enable_project_expert=enable_project_expert)
     auditor_instruction = build_auditor_instruction(
-        threat_model, project_summary, tools=auditor_tools
+        threat_model,
+        project_summary,
+        tools=auditor_tools,
+        extensions=active_extensions,
     )
 
     with PhaseContextCache(
@@ -95,6 +104,7 @@ async def discovery_phase(ctx: Context, node_input: list[str] | None = None) -> 
             project_summary,
             cached_content=cache.cache_name,
             enable_project_expert=enable_project_expert,
+            extensions=active_extensions,
         )
 
         diff_base = ctx.state.get("diff_base")

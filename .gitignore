@@ -18,8 +18,11 @@ output/
 # Environment
 .env
 .envrc
+/live-urls.md
 
 # Rust / WASM build artifacts
 target/
 **/target/
 **/dist/
+# Verilator simulation artifacts
+obj_dir/

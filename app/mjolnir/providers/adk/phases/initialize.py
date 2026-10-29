@@ -27,9 +27,23 @@ async def initialize(ctx: Context, node_input: str) -> Union[list[str], str]:
     ctx.state["mode"] = input_data["mode"]
     ctx.state["min_poc_severity"] = input_data.get("min_poc_severity", "Medium")
     ctx.state["test_path_tokens"] = input_data.get("test_path_tokens", [])
+    ctx.state["extensions"] = input_data.get("extensions", [])
     ctx.state["enable_project_expert"] = input_data["enable_project_expert"]
     ctx.state.setdefault("vulnerabilities", [])
     ctx.state.setdefault("project_expert_qa_history", [])
+    run_dir = ctx.state.get("run_dir")
+    if run_dir and not ctx.state.get("project_expert_summary"):
+        from pathlib import Path
+        from constants import PROJECT_EXPERT_SUMMARY_FILENAME
+
+        summary_file = Path(run_dir) / PROJECT_EXPERT_SUMMARY_FILENAME
+        if summary_file.is_file():
+            try:
+                ctx.state["project_expert_summary"] = summary_file.read_text(
+                    encoding="utf-8"
+                ).strip()
+            except Exception:
+                pass
 
     ingest_path = input_data.get("ingest_path")
     if ingest_path:

@@ -48,6 +48,8 @@ USER_ID = "user.id"
 class GenAiSystemValues:
     GEMINI = DummyAttr("gemini")
     VERTEX_AI = DummyAttr("vertex_ai")
+    ANTHROPIC = DummyAttr("anthropic")
+    OPENAI = DummyAttr("openai")
 EOF
 
   for f in src/google/adk/telemetry/_experimental_semconv.py \

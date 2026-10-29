@@ -161,7 +161,9 @@ def run_analysis(
     bucket: str = None,
     project_name: str = None,
     project_output_dir: str = None,
+    phase_ids: list[str] | None = None,
     test_path_tokens: list[str] | None = None,
+    extensions: list[str] | None = None,
 ) -> tuple[list[Vulnerability], str]:
     """ADK 2.0 provider pipeline: executes a multi-node workflow graph."""
     logger.info(f"Initializing ADK 2.0 Workflow Engine (mode={mode})...")
@@ -179,8 +181,15 @@ def run_analysis(
     except Exception as e:
         logger.warning(f"Could not inspect ADK client metadata: {e}")
 
-    enable_project_expert = mode == PIPELINE_MODE_FULL
-    analysis_workflow = build_analysis_workflow(mode=mode, ingest_path=ingest_path)
+    if phase_ids:
+        enable_project_expert = PHASE_EXPLORATION_ID in phase_ids or (
+            mode == PIPELINE_MODE_FULL
+            and bool(run_dir and (Path(run_dir) / "project_expert_summary.md").is_file())
+        )
+        analysis_workflow = build_composable_workflow(phase_ids=phase_ids)
+    else:
+        enable_project_expert = mode == PIPELINE_MODE_FULL
+        analysis_workflow = build_analysis_workflow(mode=mode, ingest_path=ingest_path)
 
     session_service = InMemorySessionService()
     runner = Runner(
@@ -206,6 +215,7 @@ def run_analysis(
         "project_name": project_name,
         "project_output_dir": project_output_dir,
         "test_path_tokens": test_path_tokens or [],
+        "extensions": extensions or [],
         "enable_project_expert": enable_project_expert,
         "usage_tracker": usage_tracker,
         "project_expert_qa_history": [],
@@ -236,6 +246,7 @@ def run_analysis(
         "project_name": project_name,
         "project_output_dir": project_output_dir,
         "test_path_tokens": test_path_tokens or [],
+        "extensions": extensions or [],
         "enable_project_expert": enable_project_expert,
     }
 

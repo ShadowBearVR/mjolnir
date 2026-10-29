@@ -23,6 +23,42 @@ from utilities.prompt_loader import prompt_registry
 
 AUDITOR_TOOLS = [ctags_search, ast_search, grep_search, glob, read_file, search_cwe]
 
+_EXTENSION_TO_SKILL: dict[str, str] = {
+    "c": "c-audit-skill",
+    "h": "c-audit-skill",
+    "cc": "c-audit-skill",
+    "cpp": "c-audit-skill",
+    "cxx": "c-audit-skill",
+    "hpp": "c-audit-skill",
+    "hh": "c-audit-skill",
+    "rs": "rust-audit-skill",
+    "sv": "sv-audit-skill",
+    "svh": "sv-audit-skill",
+    "v": "sv-audit-skill",
+    "vh": "sv-audit-skill",
+}
+
+_ALL_SKILL_NAMES: tuple[str, ...] = (
+    "c-audit-skill",
+    "rust-audit-skill",
+    "sv-audit-skill",
+)
+
+
+def _resolve_skill_names(extensions: set[str] | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Resolves ordered, deduplicated language skill directory names for the active file extensions."""
+    if not extensions:
+        return list(_ALL_SKILL_NAMES)
+    normalized = {str(ext).lstrip(".").lower() for ext in extensions if str(ext).strip()}
+    if not normalized:
+        return list(_ALL_SKILL_NAMES)
+    selected: list[str] = []
+    for ext in sorted(normalized):
+        skill_name = _EXTENSION_TO_SKILL.get(ext)
+        if skill_name and skill_name not in selected:
+            selected.append(skill_name)
+    return selected
+
 
 def get_auditor_tools(enable_project_expert: bool = False) -> list:
     """Builds the toolset for AuditorAgent, appending optional capability tools as enabled."""
@@ -36,6 +72,7 @@ def build_auditor_instruction(
     threat_model_context: str = "",
     project_expert_summary: str = "",
     tools: list | None = None,
+    extensions: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Builds the full, deterministic system instruction for the AuditorAgent."""
     active_tools = tools if tools is not None else AUDITOR_TOOLS
@@ -52,12 +89,10 @@ def build_auditor_instruction(
         )
 
     skills_dir = pathlib.Path(current_dir) / "skills"
-    c_skill_path = skills_dir / "c-audit-skill" / "SKILL.md"
-    rust_skill_path = skills_dir / "rust-audit-skill" / "SKILL.md"
-    if c_skill_path.exists():
-        instruction += f"\n\n{c_skill_path.read_text()}\n"
-    if rust_skill_path.exists():
-        instruction += f"\n\n{rust_skill_path.read_text()}\n"
+    for skill_name in _resolve_skill_names(extensions):
+        skill_path = skills_dir / skill_name / "SKILL.md"
+        if skill_path.exists():
+            instruction += f"\n\n{skill_path.read_text(encoding='utf-8')}\n"
     return instruction
 
 
@@ -67,11 +102,15 @@ def get_auditor_agent(
     project_expert_summary: str = "",
     cached_content: str | None = None,
     enable_project_expert: bool = False,
+    extensions: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> Agent:
     """Factory to create an AuditorAgent with appropriate system prompts and optional cached content."""
     tools = get_auditor_tools(enable_project_expert=enable_project_expert)
     instruction = build_auditor_instruction(
-        threat_model_context, project_expert_summary, tools=tools
+        threat_model_context,
+        project_expert_summary,
+        tools=tools,
+        extensions=extensions,
     )
     generate_content_config = (
         types.GenerateContentConfig(cached_content=cached_content) if cached_content else None

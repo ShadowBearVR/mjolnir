@@ -102,7 +102,7 @@ In your repository's `flake.nix`, add Mjolnir as an input and use `mjolnir.lib.d
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     mjolnir = {
-      url = "github:chipsalliance/mjolnir";
+      url = "github:<org>/mjolnir";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -158,13 +158,21 @@ nix run .#deploy-gcs-runs -- --bucket my-reports-bucket --output-dir ./test-out/
 
 ### Step 4: Add PR Audit CI Workflow (`.github/workflows/mjolnir_audit.yml`)
 
-Add an automated CI workflow in `.github/workflows/mjolnir_audit.yml` to audit incoming pull requests and sync artifacts:
+> **CRITICAL — Fork-PR & Self-Hosted Runner Security:**
+> Never execute untrusted fork PR code (`nix run path:.#ci` or `actions/checkout` of an unreviewed fork head) directly on a privileged self-hosted cloud runner holding Vertex AI / LLM API keys or GCS write credentials—an untrusted PR could modify `flake.nix`, Cargo `build.rs` / proc-macros, or Bazel rules to achieve arbitrary code execution. Always:
+>
+> 1. **Gate execution behind maintainer review** (e.g., require a maintainer-applied `mjolnir:run-audit` label or a protected GitHub Environment with required reviewers before auditing external fork PRs).
+> 2. **Invoke Mjolnir from a pinned trusted flake reference** (`github:<org>/mjolnir/<pinned-commit-sha>`), never `path:.#ci` from the untrusted PR checkout.
+> 3. **Isolate runner network & credentials**: Mjolnir automatically isolates `run_harness_command` PoC child processes inside rootless `bwrap --unshare-net` on Linux; in addition, block build UIDs from reaching cloud metadata endpoints (`169.254.169.254`) via host firewall rules and scope GCS credentials strictly to write-only artifact upload.
+
+Add a maintainer-gated CI workflow in `.github/workflows/mjolnir_audit.yml`:
 
 ```yaml
 name: Mjolnir Security Audit (PR)
 
 on:
-  pull_request:
+  pull_request_target:
+    types: [labeled, synchronize]
     branches:
       - main
 
@@ -175,13 +183,19 @@ permissions:
 jobs:
   mjolnir-audit:
     name: Mjolnir Security Audit (PR)
+    # Run automatically for trusted internal branches, or after a maintainer applies 'mjolnir:run-audit'
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      contains(github.event.pull_request.labels.*.name, 'mjolnir:run-audit')
+    environment: mjolnir-audit
     runs-on: e2-standard-2-AI
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
+      - name: Checkout PR at explicit SHA (audited by pinned Mjolnir flake)
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Install Nix
@@ -192,9 +206,13 @@ jobs:
           echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
           echo "$HOME/.nix-profile/bin" >> $GITHUB_PATH
 
-      - name: Run Mjolnir Security Audit
+      - name: Run Mjolnir Security Audit (Pinned Trusted Flake)
+        env:
+          MJOLNIR_FLAKE: "github:<org>/mjolnir/<pinned-commit-sha>"
         run: |
-          nix run path:.#ci -- \
+          nix run "${MJOLNIR_FLAKE}#mjolnir-app" -- \
+            --spec "./tools/mjolnir/ci-spec.json" \
+            --local-dir "." \
             --diff-base "${{ github.event.pull_request.base.sha }}" \
             --diff-head "${{ github.event.pull_request.head.sha }}" \
             --pr "${{ github.event.pull_request.html_url }}" \
@@ -203,20 +221,25 @@ jobs:
       - name: Post Inline PR Review Comments
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MJOLNIR_FLAKE: "github:<org>/mjolnir/<pinned-commit-sha>"
         run: |
-          nix run path:.#post-pr-comments -- \
+          nix run "${MJOLNIR_FLAKE}#post-pr-comments" -- \
             --output-dir "./test-out/results" \
             --pr "${{ github.event.pull_request.html_url }}"
 
       - name: Emit Markdown Report
+        env:
+          MJOLNIR_FLAKE: "github:<org>/mjolnir/<pinned-commit-sha>"
         run: |
-          nix run path:.#emit-report -- \
+          nix run "${MJOLNIR_FLAKE}#emit-report" -- \
             --output "report.md" \
             --format "markdown"
 
       - name: Sync Audit Artifacts to GCS
+        env:
+          MJOLNIR_FLAKE: "github:<org>/mjolnir/<pinned-commit-sha>"
         run: |
-          nix run path:.#deploy-gcs-runs -- \
+          nix run "${MJOLNIR_FLAKE}#deploy-gcs-runs" -- \
             --bucket "my-reports-bucket" \
             --output-dir "./test-out/results"
 ```
