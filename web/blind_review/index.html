@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<!-- Licensed under the Apache-2.0 license -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://storage.googleapis.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
+  <meta name="description" content="Single-question, one-finding-at-a-time blind security review portal.">
+  <title>Mjolnir Security Review</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23111827'/%3E%3Ctext x='50' y='69' text-anchor='middle' font-family='monospace' font-weight='700' font-size='58' fill='%2327bcac'%3EM%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar" id="app-topbar">
+    <div class="topbar-brand">
+      <h1 class="topbar-title" id="deck-title">Mjolnir Security Review</h1>
+      <span class="pill pill-mono" id="target-commit-pill">Loading...</span>
+      <a class="pill hidden" id="repo-tree-link" href="https://github.com/" target="_blank" rel="noopener noreferrer">Repo &#8599;</a>
+    </div>
+
+    <div class="topbar-progress" aria-label="Review progress">
+      <div class="progress-track">
+        <svg class="progress-svg" viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label="Completion bar">
+          <rect id="progress-rect" x="0" y="0" width="0" height="8" rx="4"></rect>
+        </svg>
+      </div>
+      <span class="progress-label" id="progress-count-label">0 / 0</span>
+      <span class="save-status" id="autosave-status-label">Enter email to start</span>
+    </div>
+
+    <div class="topbar-actions">
+      <button type="button" class="btn" id="btn-toggle-tm" aria-expanded="false" aria-controls="threat-model-drawer">Threat Model</button>
+      <span class="pill pill-mono" id="active-email-pill">Email: --</span>
+      <button type="button" class="btn btn-ghost" id="btn-switch-email">Switch</button>
+    </div>
+  </header>
+
+  <div class="notice-banner hidden" id="notice-banner" role="status" aria-live="polite">
+    <span id="notice-banner-text"></span>
+    <button type="button" class="btn btn-ghost" id="btn-dismiss-notice">Dismiss</button>
+  </div>
+
+  <section class="tm-drawer hidden" id="threat-model-drawer" aria-label="Repository Threat Model">
+    <div class="tm-drawer-inner">
+      <div class="tm-drawer-header">
+        <strong>Target Repository Threat Model</strong>
+        <button type="button" class="btn btn-ghost" id="btn-close-tm">Close</button>
+      </div>
+      <pre class="tm-pre" id="threat-model-content">No threat model attached to this deck.</pre>
+    </div>
+  </section>
+
+  <main class="card-stage" id="card-stage">
+    <aside class="definition-rail" id="definition-rail" aria-labelledby="def-rail-heading">
+      <div class="definition-card">
+        <h2 class="definition-heading" id="def-rail-heading">What is a Security-relevant Bug?</h2>
+        <p>
+          We use the term <em>security-relevant bug</em> for any bug that violates a security property in the project&#8217;s threat model, whether or not it is exploitable in a deployed system.
+        </p>
+        <p>
+          This includes exploitable vulnerabilities, but also weaknesses such as a missing countermeasure that maintainers would fix for security reasons.
+        </p>
+        <p>
+          Whether a candidate finding is a security-relevant bug can depend heavily on the project&#8217;s threat model and trust boundaries, such as which boot stage trusts which input.
+        </p>
+      </div>
+    </aside>
+
+    <article class="card-shell" id="active-card-shell">
+      <div class="card-header">
+        <div class="card-meta-row">
+          <div class="card-badges">
+            <span class="pill pill-strong" id="card-position-pill">Finding 0 of 0</span>
+            <span class="badge-sev badge-sev-Medium" id="card-sev-badge">MEDIUM</span>
+            <span class="pill pill-mono" id="card-cwe-pill">CWE</span>
+          </div>
+          <span class="pill" id="card-current-verdict-pill">Unanswered</span>
+        </div>
+
+        <h2 class="card-title" id="card-title-heading">Loading review deck...</h2>
+
+        <div class="card-loc-bar">
+          <code class="loc-code" id="card-location-code">--</code>
+          <a
+            class="btn hidden"
+            id="card-github-link"
+            href="https://github.com/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >View on GitHub &#8599;</a>
+        </div>
+      </div>
+
+      <div class="card-body" id="card-body-sections">
+        <section class="section-block hidden" id="section-source-snippet">
+          <div class="source-toolbar">
+            <h3>Pinned Source Context</h3>
+            <span class="source-range-meta" id="source-range-label"></span>
+            <div class="source-ctx-tabs" role="group" aria-label="Source context window">
+              <button type="button" class="ctx-btn active" id="btn-src-ctx-25" data-ctx="25">&#177;25 lines</button>
+              <button type="button" class="ctx-btn" id="btn-src-ctx-80" data-ctx="80">&#177;80 lines</button>
+              <button type="button" class="ctx-btn" id="btn-src-ctx-full" data-ctx="full">Full File</button>
+            </div>
+          </div>
+          <div class="source-viewer-scroll" id="card-source-scroll"></div>
+        </section>
+
+        <section class="section-block" id="section-description">
+          <h3>Claim Description</h3>
+          <div class="rich-text" id="card-description-content"></div>
+        </section>
+
+        <section class="section-block hidden" id="section-attack-vector">
+          <h3>Attack Vector</h3>
+          <div class="rich-text" id="card-attack-vector-content"></div>
+        </section>
+
+        <section class="section-block hidden" id="section-recommendation">
+          <h3>Suggested Remediation</h3>
+          <div class="rich-text" id="card-recommendation-content"></div>
+        </section>
+
+        <section class="section-block hidden" id="section-pass2-poc">
+          <h3>Proof-of-Concept Artifacts</h3>
+          <div class="poc-tabs" id="poc-tab-bar">
+            <button type="button" class="ctx-btn active" id="btn-poc-tab-diff" data-poc-tab="diff">poc_patch.diff</button>
+            <button type="button" class="ctx-btn" id="btn-poc-tab-repro" data-poc-tab="repro">reproduce.sh</button>
+            <button type="button" class="ctx-btn" id="btn-poc-tab-log" data-poc-tab="log">harness_commands.log</button>
+            <button type="button" class="ctx-btn" id="btn-poc-tab-summary" data-poc-tab="summary">PoC Summary</button>
+          </div>
+          <pre class="code-block" id="card-poc-artifact-pre"></pre>
+        </section>
+      </div>
+
+      <footer class="grade-dock" id="card-grade-dock">
+        <div class="completion-banner hidden" id="completion-banner" role="status">
+          All findings reviewed &#8212; your answers are saved automatically. Thank you!
+        </div>
+
+        <div class="question-header">
+          <p class="question-prompt" id="grade-question-heading">Is this a security-relevant bug?</p>
+          <p class="grade-helper" id="grade-helper-text">
+            Yes = Security-relevant bug under the project&#8217;s threat model. No = Prevented by existing checks/countermeasures, non-security issue, or outside the threat model.
+          </p>
+        </div>
+
+        <div class="choice-grid" id="answer-button-group">
+          <button type="button" class="btn btn-choice btn-choice-yes" id="btn-answer-yes">
+            <span>Yes &#8212; Security-Relevant</span>
+            <span class="kbd-hint">Y</span>
+          </button>
+          <button type="button" class="btn btn-choice btn-choice-no" id="btn-answer-no">
+            <span>No &#8212; Not a Security Bug</span>
+            <span class="kbd-hint">N</span>
+          </button>
+        </div>
+
+        <div class="nav-row">
+          <button type="button" class="btn btn-ghost" id="btn-prev-card">&#8592; Previous</button>
+          <button type="button" class="btn btn-ghost" id="btn-next-card">Next &#8594;</button>
+        </div>
+      </footer>
+    </article>
+  </main>
+
+  <div class="modal-overlay hidden" id="email-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="email-modal-heading">
+    <div class="modal-box">
+      <h2 id="email-modal-heading">Start Security Review</h2>
+      <p id="email-modal-desc">
+        Enter your work email to begin. Findings are grouped by source file into ~11-finding chunks (starting at a random chunk) &#8212; try 1&#8211;2 chunks or stop whenever you like; every answer saves automatically.
+      </p>
+      <form id="form-email-entry" novalidate>
+        <div class="form-field">
+          <label for="input-reviewer-email">Work Email</label>
+          <input
+            type="email"
+            class="form-input"
+            id="input-reviewer-email"
+            autocomplete="email"
+            spellcheck="false"
+            maxlength="120"
+            placeholder="name@company.com"
+            required
+          >
+          <div class="form-error" id="email-form-error"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary" id="btn-confirm-email">Start Review</button>
+          <button type="button" class="btn hidden" id="btn-cancel-email">Cancel</button>
+          <button type="button" class="btn btn-ghost hidden" id="btn-clear-session">Sign Out</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

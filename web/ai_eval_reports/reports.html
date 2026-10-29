@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!-- Licensed under the Apache-2.0 license -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta name="description" content="Mjolnir AI Pre-Review Reports, Scorecards, Stage-3 Meta-Reviews, and Evaluation Figures for caliptra-sw.">
+  <title>Mjolnir AI Pre-Review Reports &amp; Figures</title>
+  <link rel="stylesheet" href="./reports.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title-group">
+      <h1 class="topbar-title">Mjolnir AI Pre-Review Reports (caliptra-sw)</h1>
+      <a class="back-link" id="link-interactive-dashboard" href="./index.html">&#8592; Interactive Claim &amp; PoC Explorer</a>
+    </div>
+    <nav class="nav-tabs" aria-label="Report selection">
+      <button type="button" class="tab-btn active" id="tab-v2-report" data-doc="v2_report">Pre-Review v2 Report &amp; Plots</button>
+      <button type="button" class="tab-btn" id="tab-v2-scorecard" data-doc="v2_scorecard">v2 Scorecard</button>
+      <button type="button" class="tab-btn" id="tab-v2-meta" data-doc="v2_meta">Stage-3 File Meta-Reviews (38)</button>
+      <button type="button" class="tab-btn" id="tab-v1-report" data-doc="v1_report">Pre-Review v1 Report (Deprecated)</button>
+      <button type="button" class="tab-btn" id="tab-v1-scorecard" data-doc="v1_scorecard">v1 Scorecard (Deprecated)</button>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="figures-grid" id="v2-figures-section" aria-label="Evaluation Figures">
+      <article class="figure-card">
+        <h3>RQ1: Multi-Agent Ablations &amp; Single-Agent Baselines</h3>
+        <img class="figure-img" id="img-rq1" src="./docs/plots/fig_rq1_ablation_comparison.svg" alt="RQ1 Ablation Comparison">
+      </article>
+      <article class="figure-card">
+        <h3>RQ2: Staged Verification Funnel</h3>
+        <img class="figure-img" id="img-rq2" src="./docs/plots/fig_rq2_verification_funnel.svg" alt="RQ2 Verification Funnel">
+      </article>
+      <article class="figure-card">
+        <h3>RQ4: Phase Token Breakdown</h3>
+        <img class="figure-img" id="img-rq4-phase" src="./docs/plots/fig_rq4_phase_token_breakdown.svg" alt="RQ4 Phase Token Breakdown">
+      </article>
+      <article class="figure-card">
+        <h3>RQ4: Token Pathology Distribution</h3>
+        <img class="figure-img" id="img-rq4-path" src="./docs/plots/fig_rq4_token_pathology.svg" alt="RQ4 Token Pathology">
+      </article>
+    </section>
+
+    <article class="doc-card">
+      <div class="md-body" id="report-markdown-mount">Loading report...</div>
+    </article>
+  </main>
+
+  <script type="module" src="./reports.js"></script>
+</body>
+</html>

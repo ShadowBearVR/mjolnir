@@ -1,0 +1,6 @@
+{
+  "schema_version": 2,
+  "submissions_bucket": "",
+  "study_prefix": "v2",
+  "default_study_key": "caliptra-v2"
+}
