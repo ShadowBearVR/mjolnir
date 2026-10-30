@@ -85,6 +85,14 @@ class BlindReviewFinding(BaseModel):
         default_factory=dict,
         description="Maps normalized reviewer email/handle to normalized binary verdict ('TP' or 'FP').",
     )
+    reviewer_severities: dict[str, str] = Field(
+        default_factory=dict,
+        description="Maps normalized reviewer email/handle to normalized optional severity ('High', 'Medium', 'Low', etc.).",
+    )
+    reviewer_notes: dict[str, str] = Field(
+        default_factory=dict,
+        description="Maps normalized reviewer email/handle (or '<email>#pass2') to optional free-text notes.",
+    )
     adjudicated_label: str | None = Field(
         default=None,
         description="Consensus verdict after adjudication: 'TP', 'FP', or 'exclude'",
@@ -121,10 +129,17 @@ class BlindReviewFinding(BaseModel):
         mapping = {
             "critical": "Critical",
             "crit": "Critical",
+            "severe": "High",
+            "high/critical": "High",
+            "high / critical": "High",
             "high": "High",
             "medium": "Medium",
             "med": "Medium",
+            "moderate": "Medium",
             "low": "Low",
+            "benign": "Low",
+            "benign/low": "Low",
+            "benign / low": "Low",
             "informational": "Informational",
             "info": "Informational",
         }

@@ -1411,7 +1411,7 @@ class FindingPooler:
             sev = BlindReviewFinding._normalize_severity(entry.get("expert_severity"))
             if sev and lbl == "TP":
                 bf.expert_severity = sev
-            note = str(entry.get("notes") or "").strip()[:1000]
+            note = str(entry.get("notes") or "").strip()[:65536]
             if note:
                 tag = f"[{r1_ldap or 'r1'}] {note}"
                 if tag not in bf.notes:
@@ -1427,7 +1427,7 @@ class FindingPooler:
             sev = BlindReviewFinding._normalize_severity(entry.get("expert_severity"))
             if sev and lbl == "TP" and not bf.expert_severity:
                 bf.expert_severity = sev
-            note = str(entry.get("notes") or "").strip()[:1000]
+            note = str(entry.get("notes") or "").strip()[:65536]
             if note:
                 tag = f"[{r2_ldap or 'r2'}] {note}"
                 if tag not in bf.notes:
@@ -1447,7 +1447,7 @@ class FindingPooler:
             sev = BlindReviewFinding._normalize_severity(entry.get("expert_severity"))
             if sev:
                 bf.expert_severity = sev
-            note = str(entry.get("notes") or "").strip()[:1000]
+            note = str(entry.get("notes") or "").strip()[:65536]
             if note:
                 tag = f"[{_adj_ldap or 'adj'}] {note}"
                 if tag not in bf.notes:
@@ -1462,7 +1462,7 @@ class FindingPooler:
             )
             if poc_yn:
                 bf.poc_demonstrates = poc_yn
-            note = str(entry.get("notes") or "").strip()[:1000]
+            note = str(entry.get("notes") or "").strip()[:65536]
             if note:
                 tag = f"[{_p2_ldap or 'pass2'}] {note}"
                 if tag not in bf.notes:
@@ -1687,6 +1687,23 @@ class FindingPooler:
         pool = [BlindReviewFinding.model_validate(item) for item in raw_pool]
         by_id = {bf.review_id: bf for bf in pool}
 
+        def _upsert_tagged_note(
+            existing: str, tag_key: str, raw_note: str, remove_if_empty: bool = False
+        ) -> str:
+            clean = (
+                re.sub(r"[\x00-\x1f\x7f]+", " ", str(raw_note or ""))
+                .replace("|", "/")
+                .strip()[:65536]
+            )
+            if not clean and not remove_if_empty:
+                return existing
+            prefix = f"[{tag_key}] "
+            parts = [seg.strip() for seg in str(existing or "").split(" | ") if seg.strip()]
+            kept = [seg for seg in parts if not seg.startswith(prefix)]
+            if clean:
+                kept.append(f"{prefix}{clean}")
+            return " | ".join(kept)
+
         for (deck_pass, email), card_map in sorted(merged_by_pass_email.items()):
             for rid, (_rank, entry) in card_map.items():
                 bf = by_id.get(rid)
@@ -1698,6 +1715,14 @@ class FindingPooler:
                     )
                     if lbl in ("TP", "FP"):
                         bf.reviewer_votes[email] = lbl
+                    has_sev_key = "expert_severity" in entry or "severity" in entry
+                    sev = BlindReviewFinding._normalize_severity(
+                        entry.get("expert_severity") or entry.get("severity")
+                    )
+                    if lbl == "TP" and sev:
+                        bf.reviewer_severities[email] = sev
+                    elif lbl == "FP" or (has_sev_key and not sev):
+                        bf.reviewer_severities.pop(email, None)
                 else:
                     poc_yn = BlindReviewFinding._normalize_yes_no(
                         entry.get("poc_demonstrates") or entry.get("verdict")
@@ -1705,6 +1730,20 @@ class FindingPooler:
                     if poc_yn:
                         bf.poc_demonstrates = poc_yn
 
+                if "notes" in entry:
+                    note_key = email if deck_pass == "pass1" else f"{email}#pass2"
+                    clean_note = re.sub(
+                        r"[\x00-\x1f\x7f]+", " ", str(entry.get("notes") or "")
+                    ).strip()[:65536]
+                    if clean_note:
+                        bf.reviewer_notes[note_key] = clean_note
+                    else:
+                        bf.reviewer_notes.pop(note_key, None)
+                    bf.notes = _upsert_tagged_note(
+                        bf.notes, note_key, clean_note, remove_if_empty=True
+                    )
+
+        sev_rank = {"Critical": 5, "High": 4, "Medium": 3, "Low": 2, "Informational": 1}
         for bf in pool:
             voters = [
                 (em, norm)
@@ -1715,6 +1754,19 @@ class FindingPooler:
                 bf.reviewer_1_label = voters[0][1]
             if len(voters) >= 2:
                 bf.reviewer_2_label = voters[1][1]
+            if not bf.adjudicated_label:
+                tp_sevs = [
+                    norm_sev
+                    for em, vote in voters
+                    if vote == "TP"
+                    and (
+                        norm_sev := BlindReviewFinding._normalize_severity(
+                            bf.reviewer_severities.get(em)
+                        )
+                    )
+                ]
+                if tp_sevs:
+                    bf.expert_severity = max(tp_sevs, key=lambda s: sev_rank.get(s, 0))
             if bf.resolved_label == "TP" and not bf.normalized_expert_severity:
                 bf.expert_severity = BlindReviewFinding._normalize_severity(bf.severity) or "Medium"
 
@@ -1746,6 +1798,7 @@ class FindingPooler:
                     "r1_verdict": r1,
                     "r2_verdict": r2,
                     "reviewer_votes": valid_votes,
+                    "reviewer_severities": dict(sorted(bf.reviewer_severities.items())),
                     "reviewer_notes": bf.notes,
                 }
 

@@ -24,7 +24,8 @@ const VALID_KEY_PREFIX_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,126}\/$/;
 const VALID_SAFE_FIELD_RE = /^[A-Za-z0-9+/=_.:@-]{1,4096}$/;
 const VALID_HEX_SIG_RE = /^[0-9a-f]{128,2048}$/;
 const VALID_B64URL_PART_RE = /^[A-Za-z0-9_-]{40,4096}$/;
-const MAX_SNAPSHOT_BYTES = 56 * 1024;
+const MAX_SNAPSHOT_BYTES = 59 * 1024;
+const MAX_SINGLE_NOTE_CHARS = 100000;
 const CLOUD_DEBOUNCE_MS = 700;
 
 const state = {
@@ -56,7 +57,6 @@ const state = {
   syncTimer: null,
   syncInFlight: false,
   retryAttempt: 0,
-  autoAdvanceTimer: null,
 };
 
 function byId(id) {
@@ -111,6 +111,20 @@ function normalizeBinaryVerdict(raw) {
   return "";
 }
 
+function normalizeReviewerSeverity(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "low" || s === "benign" || s === "benign/low" || s === "benign / low") return "Low";
+  if (s === "medium" || s === "med") return "Medium";
+  if (s === "severe" || s === "high" || s === "critical") return "Severe";
+  return "";
+}
+
+function sanitizeReviewerNotes(raw, trimEdges = false) {
+  const cleaned = String(raw || "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  const normalized = trimEdges ? cleaned.trim() : cleaned;
+  return normalized.slice(0, MAX_SINGLE_NOTE_CHARS);
+}
+
 function isPass2() {
   return Boolean(state.deck && state.deck.pass === "pass2");
 }
@@ -118,7 +132,7 @@ function isPass2() {
 function getCardEntry(reviewId) {
   const entry = state.reviews[reviewId];
   if (!entry || typeof entry !== "object") {
-    return { verdict: "", poc_demonstrates: "", updated_at: "" };
+    return { verdict: "", poc_demonstrates: "", expert_severity: "", notes: "", updated_at: "" };
   }
   return entry;
 }
@@ -366,9 +380,18 @@ function sanitizeStoredReviews(rawMap) {
     const verdict = normalizeBinaryVerdict(val.verdict);
     const rawPoc = String(val.poc_demonstrates || "").toLowerCase();
     const pocDem = rawPoc === "yes" || rawPoc === "no" ? rawPoc : "";
+    const expertSev =
+      verdict === "No" ? "" : normalizeReviewerSeverity(val.expert_severity || val.severity);
+    const notes = sanitizeReviewerNotes(val.notes, false);
     const updatedAt = String(val.updated_at || "").slice(0, 40);
-    if (verdict || pocDem) {
-      cleaned[rid] = { verdict, poc_demonstrates: pocDem, updated_at: updatedAt };
+    if (verdict || pocDem || expertSev || notes.trim()) {
+      cleaned[rid] = {
+        verdict,
+        poc_demonstrates: pocDem,
+        expert_severity: expertSev,
+        notes,
+        updated_at: updatedAt,
+      };
     }
   }
   return cleaned;
@@ -588,9 +611,95 @@ function buildCloudSnapshotPayload(targetSeq) {
   };
 }
 
-async function postSignedSnapshot(sp, deckSlug, targetSeq, fileBlob, useKeepalive) {
+function buildCloudSnapshotBlobs(targetSeq) {
+  const basePayload = buildCloudSnapshotPayload(targetSeq);
+  const fullBlob = new Blob([JSON.stringify(basePayload)], { type: "application/json" });
+  if (fullBlob.size <= MAX_SNAPSHOT_BYTES) {
+    return [{ sessionId: state.sessionId, blob: fullBlob }];
+  }
+
+  // Transparently shard oversized note-heavy payloads across deterministic sub-session IDs
+  // so every shard stays strictly within the GCS V4 Signed POST 60 KiB object limit and
+  // merges losslessly via Layer-2 per-card `updated_at` aggregation during ingestion.
+  const entries = Object.entries(basePayload.reviews || {});
+  const shards = [];
+  let curReviews = {};
+  let partIdx = 1;
+  const makePartSessionId = (idx) =>
+    idx === 1 ? state.sessionId : `${String(state.sessionId).slice(0, 56)}-p${idx}`;
+
+  for (const [rid, rawRev] of entries) {
+    let rev = rawRev;
+    // Guarantee every individual card entry fits inside a single 59 KiB GCS Signed POST shard.
+    const singleSessionId = makePartSessionId(partIdx);
+    let singleBlob = new Blob(
+      [JSON.stringify({ ...basePayload, session_id: singleSessionId, reviews: { [rid]: rev } })],
+      { type: "application/json" },
+    );
+    if (singleBlob.size > MAX_SNAPSHOT_BYTES && rev && typeof rev.notes === "string") {
+      let lo = 0;
+      let hi = rev.notes.length;
+      let bestNotes = "";
+      while (lo <= hi) {
+        const mid = (lo + hi) >>> 1;
+        const candidateNotes = rev.notes.slice(0, mid);
+        const testBlob = new Blob(
+          [
+            JSON.stringify({
+              ...basePayload,
+              session_id: singleSessionId,
+              reviews: { [rid]: { ...rev, notes: candidateNotes } },
+            }),
+          ],
+          { type: "application/json" },
+        );
+        if (testBlob.size <= MAX_SNAPSHOT_BYTES) {
+          bestNotes = candidateNotes;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      rev = { ...rev, notes: bestNotes };
+    }
+
+    curReviews[rid] = rev;
+    const candidatePayload = {
+      ...basePayload,
+      session_id: makePartSessionId(partIdx),
+      reviews: curReviews,
+    };
+    const candidateBlob = new Blob([JSON.stringify(candidatePayload)], {
+      type: "application/json",
+    });
+    if (candidateBlob.size > MAX_SNAPSHOT_BYTES && Object.keys(curReviews).length > 1) {
+      delete curReviews[rid];
+      const flushedSessionId = makePartSessionId(partIdx);
+      const flushedBlob = new Blob(
+        [JSON.stringify({ ...basePayload, session_id: flushedSessionId, reviews: curReviews })],
+        { type: "application/json" },
+      );
+      shards.push({ sessionId: flushedSessionId, blob: flushedBlob });
+      partIdx += 1;
+      curReviews = { [rid]: rev };
+    }
+  }
+  if (Object.keys(curReviews).length > 0) {
+    const finalSessionId = makePartSessionId(partIdx);
+    const finalBlob = new Blob(
+      [JSON.stringify({ ...basePayload, session_id: finalSessionId, reviews: curReviews })],
+      { type: "application/json" },
+    );
+    if (finalBlob.size <= MAX_SNAPSHOT_BYTES) {
+      shards.push({ sessionId: finalSessionId, blob: finalBlob });
+    }
+  }
+  return shards;
+}
+
+async function postSignedSnapshot(sp, deckSlug, sessId, targetSeq, fileBlob, useKeepalive) {
   const seqPad = String(targetSeq).padStart(6, "0");
-  const objectKey = `${sp.keyPrefix}${deckSlug}/${state.sessionId}/${seqPad}_${generateRandomHex(8)}.json`;
+  const objectKey = `${sp.keyPrefix}${deckSlug}/${sessId}/${seqPad}_${generateRandomHex(8)}.json`;
   const form = new FormData();
   form.append("key", objectKey);
   form.append("Content-Type", sp.fields["Content-Type"]);
@@ -625,9 +734,8 @@ async function flushCloudSync(useKeepalive = false) {
   if (state.syncInFlight && !useKeepalive) return;
 
   const targetSeq = state.seq;
-  const bodyStr = JSON.stringify(buildCloudSnapshotPayload(targetSeq));
-  const fileBlob = new Blob([bodyStr], { type: "application/json" });
-  if (fileBlob.size < 2 || fileBlob.size > MAX_SNAPSHOT_BYTES) {
+  const shards = buildCloudSnapshotBlobs(targetSeq);
+  if (shards.length === 0 || shards.some((s) => s.blob.size < 2 || s.blob.size > MAX_SNAPSHOT_BYTES)) {
     setSaveStatusLabel("Saved locally", "retrying");
     return;
   }
@@ -638,25 +746,28 @@ async function flushCloudSync(useKeepalive = false) {
   setSaveStatusLabel("Saving\u2026", "saving");
 
   try {
-    const res = await postSignedSnapshot(
-      state.signedPost,
-      deckSlug,
-      targetSeq,
-      fileBlob,
-      useKeepalive,
-    );
-    if (!res.ok) {
-      if (res.status === 400 || res.status === 403) {
-        const expMs = state.signedPost.expiresAt ? Date.parse(state.signedPost.expiresAt) : NaN;
-        if (!Number.isNaN(expMs) && expMs <= Date.now()) {
-          showNotice(
-            `This signed review link expired (${state.signedPost.expiresAt}). Answers remain saved in your browser — please ask the coordinator for an updated signed link.`,
-          );
-          setSaveStatusLabel("Link expired (saved locally)", "retrying");
-          return;
+    for (const shard of shards) {
+      const res = await postSignedSnapshot(
+        state.signedPost,
+        deckSlug,
+        shard.sessionId,
+        targetSeq,
+        shard.blob,
+        useKeepalive,
+      );
+      if (!res.ok) {
+        if (res.status === 400 || res.status === 403) {
+          const expMs = state.signedPost.expiresAt ? Date.parse(state.signedPost.expiresAt) : NaN;
+          if (!Number.isNaN(expMs) && expMs <= Date.now()) {
+            showNotice(
+              `This signed review link expired (${state.signedPost.expiresAt}). Answers remain saved in your browser — please ask the coordinator for an updated signed link.`,
+            );
+            setSaveStatusLabel("Link expired (saved locally)", "retrying");
+            return;
+          }
         }
+        throw new Error(`HTTP ${res.status}`);
       }
-      throw new Error(`HTTP ${res.status}`);
     }
     state.retryAttempt = 0;
     if (targetSeq > state.lastSyncedSeq) {
@@ -794,11 +905,17 @@ function renderCardSourceSnippet(card) {
   const lines = getSourceLinesForFile(card.file);
   if (!lines || lines.length === 0) {
     secEl.classList.add("hidden");
+    scrollEl.dataset.renderedKey = "";
     scrollEl.replaceChildren();
     return;
   }
 
   secEl.classList.remove("hidden");
+  const renderKey = `${card.review_id}:${state.sourceContextMode}`;
+  if (scrollEl.dataset.renderedKey === renderKey) {
+    return;
+  }
+  scrollEl.dataset.renderedKey = renderKey;
   const total = lines.length;
   const focusStart = card.start_line && card.start_line >= 1 ? Math.min(total, card.start_line) : 1;
   const focusEnd =
@@ -985,7 +1102,12 @@ function renderActiveCard() {
   byId("card-cwe-pill").textContent = card.cwe || "Unclassified CWE";
 
   const verdictPill = byId("card-current-verdict-pill");
-  verdictPill.textContent = choice ? `Answered: ${choice}` : "Unanswered";
+  const cardEntry = getCardEntry(card.review_id);
+  const revSev = normalizeReviewerSeverity(cardEntry.expert_severity);
+  const notesVal = sanitizeReviewerNotes(cardEntry.notes, false);
+  const sevLabelMap = { Low: "Benign/Low", Medium: "Medium", Severe: "Severe" };
+  const sevSuffix = !isPass2() && choice === "Yes" && revSev ? ` \u2022 ${sevLabelMap[revSev]}` : "";
+  verdictPill.textContent = choice ? `Answered: ${choice}${sevSuffix}` : "Unanswered";
 
   byId("card-title-heading").textContent = card.title || "Untitled Finding";
   byId("card-location-code").textContent = card.location
@@ -1045,8 +1167,64 @@ function renderActiveCard() {
   byId("btn-answer-yes").classList.toggle("active-yes", choice === "Yes");
   byId("btn-answer-no").classList.toggle("active-no", choice === "No");
 
+  const sevGroup = byId("optional-severity-group");
+  if (sevGroup) {
+    sevGroup.classList.toggle("hidden", isPass2());
+    const sevEnabled = !isPass2() && choice === "Yes";
+    const sevHint = byId("optional-severity-hint");
+    if (sevHint) {
+      if (choice === "No") {
+        sevHint.textContent = "Not applicable for No";
+      } else if (choice !== "Yes") {
+        sevHint.textContent = "Select Yes above to rate severity";
+      } else if (revSev) {
+        sevHint.textContent = "Click selected pill again to clear";
+      } else {
+        sevHint.textContent = "Leave blank if unsure";
+      }
+    }
+    for (const [btnId, level] of [
+      ["btn-sev-low", "Low"],
+      ["btn-sev-medium", "Medium"],
+      ["btn-sev-severe", "Severe"],
+    ]) {
+      const btn = byId(btnId);
+      if (!btn) continue;
+      const isActive = sevEnabled && revSev === level;
+      btn.disabled = !sevEnabled;
+      btn.classList.toggle("active-sev", isActive);
+      btn.setAttribute("aria-pressed", String(isActive));
+    }
+  }
+
+  const notesInput = byId("input-card-notes");
+  if (notesInput && notesInput.value !== notesVal) {
+    notesInput.value = notesVal;
+  }
+
   byId("btn-prev-card").disabled = state.activeIndex <= 0;
-  byId("btn-next-card").disabled = state.activeIndex >= state.cards.length - 1;
+  const nextBtn = byId("btn-next-card");
+  const nextLbl = byId("btn-next-card-label");
+  const nextKbd = byId("btn-next-card-kbd");
+  const atEnd = state.activeIndex >= state.cards.length - 1;
+  const wrapUnansweredIdx = atEnd ? findNextUnansweredFrom(state.activeIndex) : -1;
+  const canAdvance = !atEnd || wrapUnansweredIdx >= 0;
+  nextBtn.disabled = !canAdvance;
+  nextBtn.classList.toggle("btn-primary", Boolean(choice) && canAdvance);
+  if (nextLbl) {
+    if (!atEnd) {
+      nextLbl.textContent = "Next Finding \u2192";
+    } else if (wrapUnansweredIdx >= 0) {
+      nextLbl.textContent = "Next Unanswered \u2192";
+    } else if (choice) {
+      nextLbl.textContent = "All Reviewed \u2713";
+    } else {
+      nextLbl.textContent = "End of Deck";
+    }
+  }
+  if (nextKbd) {
+    nextKbd.classList.toggle("hidden", !canAdvance);
+  }
 }
 
 function refreshView() {
@@ -1072,9 +1250,13 @@ function setBinaryAnswer(choice) {
   }
 
   const prev = getCardEntry(card.review_id);
+  const prevSev = normalizeReviewerSeverity(prev.expert_severity);
+  const prevNotes = sanitizeReviewerNotes(prev.notes, false);
   state.reviews[card.review_id] = {
     verdict: isPass2() ? prev.verdict || "" : choice,
     poc_demonstrates: isPass2() ? (choice === "Yes" ? "yes" : "no") : prev.poc_demonstrates || "",
+    expert_severity: !isPass2() && choice === "Yes" ? prevSev : "",
+    notes: prevNotes,
     updated_at: new Date().toISOString(),
   };
 
@@ -1082,20 +1264,92 @@ function setBinaryAnswer(choice) {
   persistLocalState();
   scheduleCloudSync();
   refreshView();
+}
 
-  window.clearTimeout(state.autoAdvanceTimer);
-  state.autoAdvanceTimer = window.setTimeout(() => {
-    const nextUnanswered = findNextUnansweredFrom(state.activeIndex);
-    if (nextUnanswered >= 0) {
-      state.activeIndex = nextUnanswered;
-      refreshView();
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } else if (state.activeIndex < state.cards.length - 1) {
-      state.activeIndex += 1;
-      refreshView();
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    }
-  }, 160);
+function toggleReviewerSeverity(level) {
+  const norm = normalizeReviewerSeverity(level);
+  if (!norm || isPass2()) return;
+  const card = state.cards[state.activeIndex];
+  if (!card) return;
+  if (!state.reviewerEmail) {
+    openEmailModal();
+    return;
+  }
+  if (getCardBinaryChoice(card.review_id) !== "Yes") return;
+
+  const prev = getCardEntry(card.review_id);
+  const curSev = normalizeReviewerSeverity(prev.expert_severity);
+  const nextSev = curSev === norm ? "" : norm;
+  state.reviews[card.review_id] = {
+    verdict: normalizeBinaryVerdict(prev.verdict) || "Yes",
+    poc_demonstrates: String(prev.poc_demonstrates || ""),
+    expert_severity: nextSev,
+    notes: sanitizeReviewerNotes(prev.notes, false),
+    updated_at: new Date().toISOString(),
+  };
+
+  state.seq += 1;
+  persistLocalState();
+  scheduleCloudSync();
+  renderActiveCard();
+}
+
+function onNotesInput() {
+  const notesInput = byId("input-card-notes");
+  if (!notesInput) return;
+  const card = state.cards[state.activeIndex];
+  if (!card) return;
+  if (!state.reviewerEmail) {
+    notesInput.value = "";
+    openEmailModal();
+    return;
+  }
+
+  const cleanVal = sanitizeReviewerNotes(notesInput.value, false);
+  if (notesInput.value !== cleanVal) {
+    notesInput.value = cleanVal;
+  }
+
+  const prev = getCardEntry(card.review_id);
+  const prevNotes = sanitizeReviewerNotes(prev.notes, false);
+  if (cleanVal === prevNotes) return;
+
+  const verdict = normalizeBinaryVerdict(prev.verdict);
+  const rawPoc = String(prev.poc_demonstrates || "").toLowerCase();
+  const pocDem = rawPoc === "yes" || rawPoc === "no" ? rawPoc : "";
+  const expertSev = verdict === "No" ? "" : normalizeReviewerSeverity(prev.expert_severity);
+
+  if (!verdict && !pocDem && !expertSev && !cleanVal.trim()) {
+    delete state.reviews[card.review_id];
+  } else {
+    state.reviews[card.review_id] = {
+      verdict,
+      poc_demonstrates: pocDem,
+      expert_severity: expertSev,
+      notes: cleanVal,
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  state.seq += 1;
+  persistLocalState();
+  scheduleCloudSync(850);
+}
+
+function advanceToNextCard() {
+  if (state.cards.length === 0) return;
+  if (state.activeIndex < state.cards.length - 1) {
+    state.activeIndex += 1;
+    refreshView();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  const wrapIdx = findNextUnansweredFrom(state.activeIndex);
+  if (wrapIdx >= 0 && wrapIdx !== state.activeIndex) {
+    state.activeIndex = wrapIdx;
+    refreshView();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 }
 
 function stepCard(delta) {
@@ -1103,8 +1357,18 @@ function stepCard(delta) {
   const nextIdx = Math.max(0, Math.min(state.cards.length - 1, state.activeIndex + delta));
   if (nextIdx === state.activeIndex) return;
   state.activeIndex = nextIdx;
-  renderActiveCard();
+  refreshView();
   window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function setThreatModelOpen(open) {
+  const drawer = byId("threat-model-drawer");
+  const btn = byId("btn-toggle-tm");
+  if (!drawer || !btn) return;
+  const isOpen = Boolean(open);
+  drawer.classList.toggle("hidden", !isOpen);
+  btn.classList.toggle("active-toggle", isOpen);
+  btn.setAttribute("aria-expanded", String(isOpen));
 }
 
 function openEmailModal() {
@@ -1188,18 +1452,30 @@ function wireEvents() {
 
   byId("btn-toggle-tm").addEventListener("click", () => {
     const drawer = byId("threat-model-drawer");
-    const isNowHidden = drawer.classList.toggle("hidden");
-    byId("btn-toggle-tm").setAttribute("aria-expanded", String(!isNowHidden));
+    setThreatModelOpen(drawer.classList.contains("hidden"));
   });
   byId("btn-close-tm").addEventListener("click", () => {
-    byId("threat-model-drawer").classList.add("hidden");
-    byId("btn-toggle-tm").setAttribute("aria-expanded", "false");
+    setThreatModelOpen(false);
   });
 
   byId("btn-answer-yes").addEventListener("click", () => setBinaryAnswer("Yes"));
   byId("btn-answer-no").addEventListener("click", () => setBinaryAnswer("No"));
+  for (const [btnId, level] of [
+    ["btn-sev-low", "Low"],
+    ["btn-sev-medium", "Medium"],
+    ["btn-sev-severe", "Severe"],
+  ]) {
+    const btn = byId(btnId);
+    if (btn) {
+      btn.addEventListener("click", () => toggleReviewerSeverity(level));
+    }
+  }
+  const notesInput = byId("input-card-notes");
+  if (notesInput) {
+    notesInput.addEventListener("input", onNotesInput);
+  }
   byId("btn-prev-card").addEventListener("click", () => stepCard(-1));
-  byId("btn-next-card").addEventListener("click", () => stepCard(1));
+  byId("btn-next-card").addEventListener("click", () => advanceToNextCard());
 
   for (const ctxMode of ["25", "80", "full"]) {
     byId(`btn-src-ctx-${ctxMode}`).addEventListener("click", () => {
@@ -1249,7 +1525,20 @@ function wireEvents() {
   window.addEventListener("keydown", (e) => {
     const modalOpen = !byId("email-modal-overlay").classList.contains("hidden");
     if (modalOpen) return;
-    const tag = document.activeElement ? document.activeElement.tagName : "";
+    if (e.key === "Escape") {
+      const tmDrawer = byId("threat-model-drawer");
+      if (tmDrawer && !tmDrawer.classList.contains("hidden")) {
+        e.preventDefault();
+        setThreatModelOpen(false);
+        return;
+      }
+      if (document.activeElement && document.activeElement.id === "input-card-notes") {
+        document.activeElement.blur();
+        return;
+      }
+    }
+    const activeEl = document.activeElement;
+    const tag = activeEl ? activeEl.tagName : "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -1260,6 +1549,33 @@ function wireEvents() {
     } else if (k === "n" || k === "N" || k === "f" || k === "F") {
       e.preventDefault();
       setBinaryAnswer("No");
+    } else if (k === "1") {
+      e.preventDefault();
+      toggleReviewerSeverity("Low");
+    } else if (k === "2") {
+      e.preventDefault();
+      toggleReviewerSeverity("Medium");
+    } else if (k === "3") {
+      e.preventDefault();
+      toggleReviewerSeverity("Severe");
+    } else if (k === "ArrowRight") {
+      e.preventDefault();
+      advanceToNextCard();
+    } else if (k === "ArrowLeft") {
+      e.preventDefault();
+      stepCard(-1);
+    } else if (k === "Enter") {
+      const activeId = activeEl ? activeEl.id : "";
+      const isDockChoiceBtn =
+        activeId === "btn-answer-yes" ||
+        activeId === "btn-answer-no" ||
+        activeId === "btn-sev-low" ||
+        activeId === "btn-sev-medium" ||
+        activeId === "btn-sev-severe";
+      if ((tag !== "BUTTON" && tag !== "A") || isDockChoiceBtn) {
+        e.preventDefault();
+        advanceToNextCard();
+      }
     }
   });
 }

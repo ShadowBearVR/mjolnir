@@ -1468,10 +1468,15 @@ class TestEvaluationHarness(unittest.TestCase):
         self.assertEqual(BlindReviewFinding._normalize_label("No"), "FP")
         self.assertEqual(BlindReviewFinding._normalize_label("y"), "TP")
         self.assertEqual(BlindReviewFinding._normalize_label("n"), "FP")
+        self.assertEqual(BlindReviewFinding._normalize_severity("Benign / Low"), "Low")
+        self.assertEqual(BlindReviewFinding._normalize_severity("benign/low"), "Low")
+        self.assertEqual(BlindReviewFinding._normalize_severity("Medium"), "Medium")
+        self.assertEqual(BlindReviewFinding._normalize_severity("Severe"), "High")
 
         repo_root = Path(__file__).resolve().parent.parent
         app_js = (repo_root / "web" / "blind_review" / "app.js").read_text(encoding="utf-8")
         idx_html = (repo_root / "web" / "blind_review" / "index.html").read_text(encoding="utf-8")
+        style_css = (repo_root / "web" / "blind_review" / "style.css").read_text(encoding="utf-8")
         for forbidden_sink in (
             ".innerHTML",
             ".outerHTML",
@@ -1480,13 +1485,25 @@ class TestEvaluationHarness(unittest.TestCase):
             "alert(",
             "confirm(",
             "prompt(",
+            "autoAdvanceTimer",
         ):
             self.assertNotIn(forbidden_sink, app_js)
+        self.assertNotIn("style=", idx_html)
         self.assertIn("connect-src 'self' https://storage.googleapis.com", idx_html)
         self.assertIn("frame-ancestors 'none'", idx_html)
+        self.assertIn('class="top-chrome"', idx_html)
+        self.assertIn('id="btn-sev-low"', idx_html)
+        self.assertIn('id="btn-sev-medium"', idx_html)
+        self.assertIn('id="btn-sev-severe"', idx_html)
+        self.assertIn('id="input-card-notes"', idx_html)
+        self.assertIn('id="btn-next-card-label"', idx_html)
+        self.assertIn(".top-chrome", style_css)
         self.assertNotIn("upload/storage/v1/b/", app_js)
         self.assertIn("parseSignedAuthToken", app_js)
         self.assertIn("maskEmailForDisplay", app_js)
+        self.assertIn("advanceToNextCard", app_js)
+        self.assertIn("toggleReviewerSeverity", app_js)
+        self.assertIn("sanitizeReviewerNotes", app_js)
 
         with tempfile.TemporaryDirectory() as tmp:
             eval_dir = Path(tmp) / "caliptra-sw" / "pinned"
@@ -1711,6 +1728,123 @@ class TestEvaluationHarness(unittest.TestCase):
             self.assertEqual(summaries[0].mean_true_positives_medium_plus, 1.0)
             self.assertEqual(summaries[0].mean_false_positives, 1.0)
             self.assertEqual(summaries[0].precision_mean, 0.5)
+
+            # Now test incremental snapshots adding optional expert_severity + notes without resetting existing data
+            (snap_root / "sess-alice-desktop" / "000002_ff66.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "study_key": "caliptra-v2",
+                        "pass": "pass1",
+                        "reviewer_email": "alice@google.com",
+                        "session_id": "sess-alice-desktop",
+                        "seq": 2,
+                        "saved_at": "2026-10-27T18:30:00Z",
+                        "reviews": {
+                            c1: {
+                                "verdict": "Yes",
+                                "expert_severity": "Low",
+                                "notes": "draft rationale",
+                                "updated_at": "2026-10-27T18:30:00Z",
+                            },
+                            c2: {
+                                "verdict": "No",
+                                "notes": "checked upstream caller",
+                                "updated_at": "2026-10-27T18:30:00Z",
+                            },
+                            c3: {
+                                "verdict": "Yes",
+                                "expert_severity": "Severe",
+                                "notes": "reachable via DMA",
+                                "updated_at": "2026-10-27T18:30:00Z",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Alice refines c1 note in seq=3 and shards c3's long (>4,000-char) note into `-p2` sub-session
+            long_c3_note = "Detailed RTL call-path trace: " + ("DMA -> AXI -> SRAM " * 250)
+            long_c3_note = long_c3_note.strip()
+            self.assertGreater(len(long_c3_note), 4000)
+            (snap_root / "sess-alice-desktop" / "000003_gg77.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "study_key": "caliptra-v2",
+                        "pass": "pass1",
+                        "reviewer_email": "alice@google.com",
+                        "session_id": "sess-alice-desktop",
+                        "seq": 3,
+                        "saved_at": "2026-10-27T18:31:00Z",
+                        "reviews": {
+                            c1: {
+                                "verdict": "Yes",
+                                "expert_severity": "Low",
+                                "notes": "defense-in-depth only",
+                                "updated_at": "2026-10-27T18:31:00Z",
+                            },
+                            c2: {
+                                "verdict": "No",
+                                "notes": "checked upstream caller",
+                                "updated_at": "2026-10-27T18:30:00Z",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (snap_root / "sess-alice-desktop-p2").mkdir(parents=True)
+            (snap_root / "sess-alice-desktop-p2" / "000003_hh88.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "study_key": "caliptra-v2",
+                        "pass": "pass1",
+                        "reviewer_email": "alice@google.com",
+                        "session_id": "sess-alice-desktop-p2",
+                        "seq": 3,
+                        "saved_at": "2026-10-27T18:31:00Z",
+                        "reviews": {
+                            c3: {
+                                "verdict": "Yes",
+                                "expert_severity": "Severe",
+                                "notes": long_c3_note,
+                                "updated_at": "2026-10-27T18:31:00Z",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stats_with_meta = FindingPooler.sync_gcs_submissions(
+                eval_dir=eval_dir,
+                source=Path(tmp) / "dropbox",
+                study_key="caliptra-v2",
+            )
+            self.assertEqual(stats_with_meta.confirmed_tp_count, 1)
+            # Alice explicitly rated c1 Benign/Low ("Low") while Bob left severity blank -> expert_severity updates to Low!
+            self.assertEqual(stats_with_meta.confirmed_tp_medium_or_above_count, 0)
+            self.assertEqual(stats_with_meta.expert_severity_counts.get("Low"), 1)
+
+            synced_pool = {
+                item["review_id"]: item
+                for item in json.loads(
+                    (eval_dir / "blind_review_pool.json").read_text(encoding="utf-8")
+                )
+            }
+            self.assertEqual(synced_pool[c1]["expert_severity"], "Low")
+            self.assertEqual(synced_pool[c1]["reviewer_severities"], {"alice@google.com": "Low"})
+            self.assertEqual(
+                synced_pool[c1]["reviewer_notes"], {"alice@google.com": "defense-in-depth only"}
+            )
+            self.assertEqual(synced_pool[c1]["notes"], "[alice@google.com] defense-in-depth only")
+            self.assertNotIn("draft rationale", synced_pool[c1]["notes"])
+            self.assertEqual(
+                synced_pool[c2]["reviewer_notes"], {"alice@google.com": "checked upstream caller"}
+            )
+            self.assertEqual(synced_pool[c3]["reviewer_severities"], {"alice@google.com": "High"})
+            self.assertEqual(synced_pool[c3]["reviewer_notes"], {"alice@google.com": long_c3_note})
 
     def test_nine_config_hybrid_sampling_file_batches_and_single_voter_resolution(self) -> None:
         files = [f"runtime/src/mod_{i:02d}.rs" for i in range(14)]
@@ -1958,6 +2092,7 @@ class TestEvaluationHarness(unittest.TestCase):
         deploy_mod.assert_zero_provenance_leaks({"dummy": 1, "cards": [{"poc_patch_diff": "ok"}]})
 
         app_js = (repo_root / "web" / "blind_review" / "app.js").read_text(encoding="utf-8")
+        index_html = (repo_root / "web" / "blind_review" / "index.html").read_text(encoding="utf-8")
         self.assertNotIn("bucketOverride", app_js)
         self.assertNotIn("cfg.signed_post", app_js)
         self.assertNotIn("cfg.submissions_bucket", app_js)
@@ -1965,6 +2100,10 @@ class TestEvaluationHarness(unittest.TestCase):
         self.assertIn("VALID_SIGNED_POST_URL_RE", app_js)
         self.assertIn('form.append("file", fileBlob, "snapshot.json")', app_js)
         self.assertIn("cardHasPocArtifacts", app_js)
+        self.assertIn("buildCloudSnapshotBlobs", app_js)
+        self.assertNotIn("MAX_NOTE_CHARS = 280", app_js)
+        self.assertNotIn('maxlength="280"', index_html)
+        self.assertNotIn("notes-char-count", index_html)
 
 
 if __name__ == "__main__":
